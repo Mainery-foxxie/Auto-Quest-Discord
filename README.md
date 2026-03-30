@@ -57,7 +57,7 @@ Automatically enrolls and completes Discord quests (watch video, play on desktop
    - pkg install git
    
 2. Clone the repository  
-   - git clone 
+   - git clone https://github.com/Mainery-foxxie/Auto-Quest-Discord
    - cd Auto-Quest-Discord
 
 3. Install Python dependencies  
