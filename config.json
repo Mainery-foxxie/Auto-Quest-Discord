@@ -1,0 +1,8 @@
+{
+  "TOKEN_DISCORD": "",
+  "POLL_INTERVAL": 60,
+  "HEARTBEAT_INTERVAL": 20,
+  "AUTO_ACCEPT": true,
+  "LOG_PROGRESS": true,
+  "DEBUG": true
+}
