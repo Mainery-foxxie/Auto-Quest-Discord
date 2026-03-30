@@ -53,18 +53,15 @@ Automatically enrolls and completes Discord quests (watch video, play on desktop
    - https://chromewebstore.google.com/detail/discord-get-user-token/accgjfooejbpdchkfpngkjjdekkcbnfd?hl=id
    
    Open Termux and run:  
-   
-   pkg install python-pip
-   
-   pkg install git
+   - pkg install python-pip
+   - pkg install git
    
 2. Clone the repository  
-   git clone 
-   
-   cd Auto-Quest-Discord
+   - git clone 
+   - cd Auto-Quest-Discord
 
 3. Install Python dependencies  
-   pip install requests
+   - pip install requests
 
 4. Configure and how to get ur token
 
@@ -75,7 +72,7 @@ Automatically enrolls and completes Discord quests (watch video, play on desktop
    Paste your token into the file (use Ctrl+X+Y+Enter to save and exit).
 
 6. Run  
-   python main.py
+   - python main.py
 
    The script will run continuously. To keep it running in the background, you can use tmux or run it with & (e.g., python main.py &).
 
