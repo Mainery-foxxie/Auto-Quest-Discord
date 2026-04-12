@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Discord Quest Auto-Completer
+Velocity X Ver (3.0) - Table display
 Reads configuration from config.json
 """
 
@@ -24,7 +25,7 @@ def load_config():
         with open(CONFIG_FILE, 'r') as f:
             return json.load(f)
     except FileNotFoundError:
-        print(f"❌ {CONFIG_FILE} not found. Please create it from config.json")
+        print(f"❌ {CONFIG_FILE} not found. Please create it from config.json.example")
         sys.exit(1)
     except json.JSONDecodeError:
         print(f"❌ {CONFIG_FILE} contains invalid JSON")
@@ -226,6 +227,23 @@ def get_quest_name(quest: dict) -> str:
         return app_name
     return f"Quest#{quest.get('id', '?')}"
 
+def get_quest_reward(quest: dict) -> str:
+    """Extract reward name from quest data."""
+    cfg = quest.get("config", {})
+    msgs = cfg.get("messages", {})
+    reward = _get(msgs, "rewardName", "reward_name")
+    if reward:
+        return reward.strip()
+    # Try rewards array
+    rewards = cfg.get("rewards", [])
+    if rewards and isinstance(rewards, list):
+        first_reward = rewards[0]
+        if isinstance(first_reward, dict):
+            reward_name = first_reward.get("name") or first_reward.get("rewardName")
+            if reward_name:
+                return reward_name.strip()
+    return "Unknown Reward"
+
 def get_expires_at(quest: dict) -> Optional[str]:
     cfg = quest.get("config", {})
     return _get(cfg, "expiresAt", "expires_at")
@@ -289,13 +307,64 @@ def get_enrolled_at(quest: dict) -> Optional[str]:
     us = get_user_status(quest)
     return _get(us, "enrolledAt", "enrolled_at")
 
+def get_time_left_string(quest: dict) -> str:
+    """Return human readable time left until expiration or estimated completion."""
+    # If completed, show "✅ DONE"
+    if is_completed(quest):
+        return f"{Colors.GREEN}✅ DONE{Colors.RESET}"
+    
+    # Check expiration first
+    expires = get_expires_at(quest)
+    if expires:
+        try:
+            exp_dt = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            if exp_dt <= now:
+                return f"{Colors.RED}Expired{Colors.RESET}"
+            delta = exp_dt - now
+            total_seconds = int(delta.total_seconds())
+            if total_seconds > 0:
+                hours = total_seconds // 3600
+                minutes = (total_seconds % 3600) // 60
+                if hours > 0:
+                    return f"{hours}h {minutes}m left"
+                else:
+                    return f"{minutes}m left"
+        except Exception:
+            pass
+    
+    # If enrolled and not completed, show remaining progress time
+    if is_enrolled(quest) and not is_completed(quest):
+        needed = get_seconds_needed(quest)
+        done = get_seconds_done(quest)
+        remaining = max(0, needed - done)
+        if remaining <= 0:
+            return f"{Colors.GREEN}✅ DONE{Colors.RESET}"
+        minutes = remaining // 60
+        seconds = remaining % 60
+        if minutes > 0:
+            return f"{minutes}m {seconds}s left"
+        else:
+            return f"{seconds}s left"
+    
+    # Not enrolled
+    return f"{Colors.YELLOW}○ Not started{Colors.RESET}"
+
+def get_status_icon(quest: dict) -> str:
+    """Return status icon and text."""
+    if is_completed(quest):
+        return f"{Colors.GREEN}✅ Completed{Colors.RESET}"
+    elif is_enrolled(quest):
+        return f"{Colors.YELLOW}▶ In Progress{Colors.RESET}"
+    else:
+        return f"{Colors.DIM}○ Not Started{Colors.RESET}"
+
 # ── Core logic ─────────────────────────────────────────────────────────────────
 class QuestAutocompleter:
     def __init__(self, api: DiscordAPI):
         self.api = api
         self.completed_ids: set = set()
 
-    # ── Fetch quests ───────────────────────────────────────────────────────────
     def fetch_quests(self) -> list:
         try:
             r = self.api.get("/quests/@me")
@@ -327,7 +396,6 @@ class QuestAutocompleter:
                 traceback.print_exc()
             return []
 
-    # ── Auto-accept ────────────────────────────────────────────────────────────
     def enroll_quest(self, quest: dict) -> bool:
         name = get_quest_name(quest)
         qid = quest["id"]
@@ -374,7 +442,6 @@ class QuestAutocompleter:
         time.sleep(2)
         return self.fetch_quests()
 
-    # ── Complete: WATCH_VIDEO ──────────────────────────────────────────────────
     def complete_video(self, quest: dict):
         name = get_quest_name(quest)
         qid = quest["id"]
@@ -423,7 +490,6 @@ class QuestAutocompleter:
             pass
         log(f"✅ Completed: {Colors.BOLD}{name}{Colors.RESET}", "ok")
 
-    # ── Complete: PLAY_ON_DESKTOP / STREAM_ON_DESKTOP ──────────────────────────
     def complete_heartbeat(self, quest: dict):
         name = get_quest_name(quest)
         qid = quest["id"]
@@ -471,7 +537,6 @@ class QuestAutocompleter:
             pass
         log(f"✅ Completed: {Colors.BOLD}{name}{Colors.RESET}", "ok")
 
-    # ── Complete: PLAY_ACTIVITY ────────────────────────────────────────────────
     def complete_activity(self, quest: dict):
         name = get_quest_name(quest)
         qid = quest["id"]
@@ -517,7 +582,6 @@ class QuestAutocompleter:
             pass
         log(f"✅ Completed: {Colors.BOLD}{name}{Colors.RESET}", "ok")
 
-    # ── Process a single quest ─────────────────────────────────────────────────
     def process_quest(self, quest: dict):
         qid = quest.get("id")
         name = get_quest_name(quest)
@@ -536,53 +600,85 @@ class QuestAutocompleter:
             self.complete_activity(quest)
         self.completed_ids.add(qid)
 
+    # ── NEW: Print quests as a formatted table ─────────────────────────────────
+    def print_quest_table(self, quests: list):
+        # Prepare rows
+        rows = []
+        for idx, q in enumerate(quests, start=1):
+            name = get_quest_name(q)
+            reward = get_quest_reward(q)
+            time_left = get_time_left_string(q)
+            status = get_status_icon(q)
+            rows.append((idx, name, reward, time_left, status))
+        
+        if not rows:
+            print(f"{Colors.YELLOW}No quests found.{Colors.RESET}")
+            return
+        
+        # Determine column widths
+        max_no = len(str(len(rows)))
+        max_name = max(len(row[1]) for row in rows)
+        max_reward = max(len(row[2]) for row in rows)
+        max_time = max(len(row[3].replace(Colors.RESET, '').replace(Colors.GREEN, '').replace(Colors.YELLOW, '').replace(Colors.DIM, '')) for row in rows)  # rough, but okay
+        max_status = max(len(row[4].replace(Colors.RESET, '').replace(Colors.GREEN, '').replace(Colors.YELLOW, '').replace(Colors.DIM, '')) for row in rows)
+        
+        # Cap widths to avoid overly wide table (optional)
+        max_name = min(max_name, 30)
+        max_reward = min(max_reward, 25)
+        
+        # Header
+        print(f"\n{Colors.BOLD}{Colors.CYAN}LIVE PROGRESS{Colors.RESET}\n")
+        header = f"| {'No':<{max_no}} | {'Quest Name':<{max_name}} | {'Reward':<{max_reward}} | {'Time Left':<{max_time}} | {'Status':<{max_status}} |"
+        separator = f"|-{'-'*max_no}-|-{'-'*max_name}-|-{'-'*max_reward}-|-{'-'*max_time}-|-{'-'*max_status}-|"
+        print(header)
+        print(separator)
+        
+        for row in rows:
+            no, name, reward, time_left, status = row
+            # Truncate long names/rewards
+            if len(name) > max_name:
+                name = name[:max_name-3] + "..."
+            if len(reward) > max_reward:
+                reward = reward[:max_reward-3] + "..."
+            print(f"| {no:<{max_no}} | {name:<{max_name}} | {reward:<{max_reward}} | {time_left:<{max_time}} | {status:<{max_status}} |")
+        print()
+
     # ── Main loop ──────────────────────────────────────────────────────────────
     def run(self):
         log("=" * 60, "info")
-        log(f"{Colors.BOLD}Discord Quest Auto-Completer v3.0{Colors.RESET}", "info")
+        log(f"{Colors.BOLD}Discord Quest Auto-Completer v3.0 (Velocity X){Colors.RESET}", "info")
         log(f"Auto-accept: {'ON' if AUTO_ACCEPT else 'OFF'}  |  Poll: {POLL_INTERVAL}s", "info")
         log("=" * 60, "info")
+
         cycle = 0
         while True:
             cycle += 1
             log(f"── Scan #{cycle} ──", "info")
+
             quests = self.fetch_quests()
-            total = len(quests)
             if not quests:
                 log("No quests found", "info")
             else:
-                enrolled_count = sum(1 for q in quests if is_enrolled(q))
-                completed_count = sum(1 for q in quests if is_completed(q))
-                completable_count = sum(1 for q in quests if is_completable(q))
-                log(
-                    f"Total: {total} quests | Enrolled: {enrolled_count} | "
-                    f"Completed: {completed_count} | Completable: {completable_count}",
-                    "info"
-                )
-                for q in quests:
-                    name = get_quest_name(q)
-                    task = get_task_type(q) or "?"
-                    if is_completed(q):
-                        status = f"{Colors.GREEN}✓{Colors.RESET}"
-                    elif is_enrolled(q):
-                        status = f"{Colors.YELLOW}▶{Colors.RESET}"
-                    else:
-                        status = f"{Colors.DIM}○{Colors.RESET}"
-                    log(f"  {status} {name} [{task}]", "info")
+                # Display table
+                self.print_quest_table(quests)
+                
                 # Auto-accept
                 quests = self.auto_accept(quests)
+
                 # Filter actionable
                 actionable = [
                     q for q in quests
                     if is_enrolled(q) and not is_completed(q) and is_completable(q)
                     and q.get("id") not in self.completed_ids
                 ]
+
                 if actionable:
                     log(f"\n{len(actionable)} quest(s) ready to complete:", "info")
                     for q in actionable:
                         self.process_quest(q)
                 else:
                     log("No quests need completion at this time", "info")
+
             log(f"\nWaiting {POLL_INTERVAL}s... (Ctrl+C to stop)\n", "info")
             time.sleep(POLL_INTERVAL)
 
@@ -590,7 +686,8 @@ class QuestAutocompleter:
 def main():
     print(f"""
 {Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════╗
-║     Discord Quest Auto-Completer.            ║
+║     Discord Quest Auto-Completer            ║
+║        Velocity X Ver (3.0)                 ║
 ║  Auto‑scan · Auto‑enroll · Auto‑complete     ║
 ╚══════════════════════════════════════════════╝{Colors.RESET}
 """)
