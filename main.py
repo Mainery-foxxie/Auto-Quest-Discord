@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Discord Quest Auto-Completer
+Discord Quest Auto-Completer  – improved edition
 Reads configuration from config.json
 """
 
@@ -9,14 +9,13 @@ import time
 import json
 import random
 import sys
-import os
 import re
 import base64
 import traceback
 from datetime import datetime, timezone
 from typing import Optional
 
-# ── Configuration from file ─────────────────────────────────────────────────────
+# ── Configuration ──────────────────────────────────────────────────────────────
 CONFIG_FILE = "config.json"
 
 def load_config():
@@ -24,7 +23,7 @@ def load_config():
         with open(CONFIG_FILE, 'r') as f:
             return json.load(f)
     except FileNotFoundError:
-        print(f"❌ {CONFIG_FILE} not found. Please create it from config.json")
+        print(f"❌ {CONFIG_FILE} not found.")
         sys.exit(1)
     except json.JSONDecodeError:
         print(f"❌ {CONFIG_FILE} contains invalid JSON")
@@ -32,29 +31,44 @@ def load_config():
 
 config = load_config()
 
-# Required fields
 TOKEN = config.get("TOKEN_DISCORD", "")
 if not TOKEN:
     print("❌ TOKEN_DISCORD not set in config.json")
     sys.exit(1)
 
-# Optional fields with defaults
-POLL_INTERVAL = config.get("POLL_INTERVAL", 60)
+POLL_INTERVAL      = config.get("POLL_INTERVAL", 60)
 HEARTBEAT_INTERVAL = config.get("HEARTBEAT_INTERVAL", 20)
-AUTO_ACCEPT = config.get("AUTO_ACCEPT", True)
-LOG_PROGRESS = config.get("LOG_PROGRESS", True)
-DEBUG = config.get("DEBUG", True)
+AUTO_ACCEPT        = config.get("AUTO_ACCEPT", True)
+LOG_PROGRESS       = config.get("LOG_PROGRESS", True)
+DEBUG              = config.get("DEBUG", False)   # default OFF for stealth
 
+# Known task types supported for completion
 SUPPORTED_TASKS = [
     "WATCH_VIDEO",
     "PLAY_ON_DESKTOP",
     "STREAM_ON_DESKTOP",
     "PLAY_ACTIVITY",
     "WATCH_VIDEO_ON_MOBILE",
+    # Additional types discovered via [?] quests – treated as heartbeat
+    "PLAY_ON_MOBILE",
+    "WATCH_VIDEO_ON_DESKTOP",
 ]
 
+# Task types that use heartbeat (play/stream) vs video-progress
+HEARTBEAT_TASKS = {
+    "PLAY_ON_DESKTOP",
+    "STREAM_ON_DESKTOP",
+    "PLAY_ACTIVITY",
+    "PLAY_ON_MOBILE",
+}
+VIDEO_TASKS = {
+    "WATCH_VIDEO",
+    "WATCH_VIDEO_ON_MOBILE",
+    "WATCH_VIDEO_ON_DESKTOP",
+}
+
 # ── Logging ────────────────────────────────────────────────────────────────────
-class Colors:
+class C:
     RESET  = "\033[0m"
     GREEN  = "\033[92m"
     YELLOW = "\033[93m"
@@ -66,40 +80,47 @@ class Colors:
 def log(msg: str, level: str = "info"):
     ts = datetime.now().strftime("%H:%M:%S")
     prefix = {
-        "info":     f"{Colors.CYAN}[INFO]{Colors.RESET}",
-        "ok":       f"{Colors.GREEN}[  OK]{Colors.RESET}",
-        "warn":     f"{Colors.YELLOW}[WARN]{Colors.RESET}",
-        "error":    f"{Colors.RED}[ ERR]{Colors.RESET}",
-        "progress": f"{Colors.DIM}[PROG]{Colors.RESET}",
-        "debug":    f"{Colors.DIM}[DBG ]{Colors.RESET}",
+        "info":     f"{C.CYAN}[INFO]{C.RESET}",
+        "ok":       f"{C.GREEN}[  OK]{C.RESET}",
+        "warn":     f"{C.YELLOW}[WARN]{C.RESET}",
+        "error":    f"{C.RED}[ ERR]{C.RESET}",
+        "progress": f"{C.DIM}[PROG]{C.RESET}",
+        "debug":    f"{C.DIM}[DBG ]{C.RESET}",
     }.get(level, f"[{level.upper()}]")
-
     if level == "debug" and not DEBUG:
         return
     if LOG_PROGRESS or level != "progress":
-        print(f"{Colors.DIM}{ts}{Colors.RESET} {prefix} {msg}")
+        print(f"{C.DIM}{ts}{C.RESET} {prefix} {msg}")
 
-# ── Build number fetcher ───────────────────────────────────────────────────────
+# ── Anti-detection helpers ─────────────────────────────────────────────────────
+def jitter(base: float, pct: float = 0.20) -> float:
+    """Return base ± pct% random variation."""
+    spread = base * pct
+    return base + random.uniform(-spread, spread)
+
+def human_sleep(base: float, pct: float = 0.25):
+    """Sleep for base seconds with random jitter."""
+    t = max(0.5, jitter(base, pct))
+    time.sleep(t)
+
+# ── Build number ───────────────────────────────────────────────────────────────
 def fetch_latest_build_number() -> int:
-    """Scrape Discord web app to get the latest client_build_number."""
     FALLBACK = 504649
     try:
-        log("Fetching latest build number from Discord...", "info")
-        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        log("Fetching Discord build number...", "info")
+        ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/128.0.0.0 Safari/537.36"
+        )
         r = requests.get("https://discord.com/app", headers={"User-Agent": ua}, timeout=15)
         if r.status_code != 200:
-            log(f"Failed to fetch Discord page ({r.status_code}), using fallback", "warn")
+            log(f"Discord page returned {r.status_code}, using fallback", "warn")
             return FALLBACK
-
         scripts = re.findall(r'/assets/([a-f0-9]+)\.js', r.text)
         if not scripts:
-            scripts_alt = re.findall(r'src="(/assets/[^"]+\.js)"', r.text)
-            scripts = [s.split('/')[-1].replace('.js', '') for s in scripts_alt]
-
-        if not scripts:
-            log("No JS assets found, using fallback", "warn")
-            return FALLBACK
-
+            alts = re.findall(r'src="(/assets/[^"]+\.js)"', r.text)
+            scripts = [s.split('/')[-1].replace('.js', '') for s in alts]
         for asset_hash in scripts[-5:]:
             try:
                 ar = requests.get(
@@ -109,19 +130,17 @@ def fetch_latest_build_number() -> int:
                 m = re.search(r'buildNumber["\s:]+["\s]*(\d{5,7})', ar.text)
                 if m:
                     bn = int(m.group(1))
-                    log(f"Build number: {Colors.BOLD}{bn}{Colors.RESET}", "ok")
+                    log(f"Build number: {C.BOLD}{bn}{C.RESET}", "ok")
                     return bn
             except Exception:
                 continue
-
         log(f"Build number not found, using fallback {FALLBACK}", "warn")
         return FALLBACK
     except Exception as e:
-        log(f"Error fetching build number: {e}, using fallback {FALLBACK}", "warn")
+        log(f"Error fetching build number: {e}, using fallback", "warn")
         return FALLBACK
 
 def make_super_properties(build_number: int) -> str:
-    """Create base64-encoded X-Super-Properties header."""
     obj = {
         "os": "Windows",
         "browser": "Discord Client",
@@ -142,9 +161,9 @@ def make_super_properties(build_number: int) -> str:
         "native_build_number": 59498,
         "client_event_source": None,
     }
-    return base64.b64encode(json.dumps(obj).encode()).decode()
+    return base64.b64encode(json.dumps(obj, separators=(',', ':')).encode()).decode()
 
-# ── HTTP helpers ───────────────────────────────────────────────────────────────
+# ── Discord API ────────────────────────────────────────────────────────────────
 class DiscordAPI:
     def __init__(self, token: str, build_number: int):
         self.token = token
@@ -161,26 +180,35 @@ class DiscordAPI:
             "Content-Type": "application/json",
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
             "User-Agent": ua,
             "X-Super-Properties": sp,
             "X-Discord-Locale": "en-US",
-            "X-Discord-Timezone": "Asia/Ho_Chi_Minh",
+            "X-Discord-Timezone": "America/New_York",
+            "X-Debug-Options": "bugReporterEnabled",
             "Origin": "https://discord.com",
             "Referer": "https://discord.com/channels/@me",
+            "DNT": "1",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
         })
 
     def get(self, path: str, **kwargs) -> requests.Response:
         url = f"https://discord.com/api/v9{path}"
         log(f"GET {path}", "debug")
+        # Small random pre-request pause to mimic human timing
+        time.sleep(random.uniform(0.1, 0.4))
         r = self.session.get(url, **kwargs)
-        log(f"  -> {r.status_code} ({len(r.content)} bytes)", "debug")
+        log(f"  -> {r.status_code}", "debug")
         return r
 
     def post(self, path: str, payload: Optional[dict] = None, **kwargs) -> requests.Response:
         url = f"https://discord.com/api/v9{path}"
         log(f"POST {path}", "debug")
+        time.sleep(random.uniform(0.1, 0.4))
         r = self.session.post(url, json=payload, **kwargs)
-        log(f"  -> {r.status_code} ({len(r.content)} bytes)", "debug")
+        log(f"  -> {r.status_code}", "debug")
         return r
 
     def validate_token(self) -> bool:
@@ -189,18 +217,16 @@ class DiscordAPI:
             if r.status_code == 200:
                 user = r.json()
                 name = user.get("username", "?")
-                log(f"Logged in as: {Colors.BOLD}{name}{Colors.RESET} (ID: {user['id']})", "ok")
+                log(f"Logged in as: {C.BOLD}{name}{C.RESET} (ID: {user['id']})", "ok")
                 return True
-            else:
-                log(f"Invalid token (status {r.status_code})", "error")
-                return False
+            log(f"Invalid token (status {r.status_code})", "error")
+            return False
         except Exception as e:
             log(f"Cannot connect to Discord: {e}", "error")
             return False
 
-# ── Quest helpers (handles both camelCase & snake_case) ────────────────────────
+# ── Quest helpers ──────────────────────────────────────────────────────────────
 def _get(d: Optional[dict], *keys):
-    """Get value from dict trying multiple key names."""
     if d is None:
         return None
     for k in keys:
@@ -243,11 +269,9 @@ def is_completable(quest: dict) -> bool:
                 return False
         except Exception:
             pass
-
     tc = get_task_config(quest)
     if not tc or "tasks" not in tc:
         return False
-
     tasks = tc["tasks"]
     return any(tasks.get(t) is not None for t in SUPPORTED_TASKS)
 
@@ -268,6 +292,13 @@ def get_task_type(quest: dict) -> Optional[str]:
             return t
     return None
 
+def get_raw_task_keys(quest: dict) -> list:
+    """Return all task keys present in the quest config (for debugging [?] quests)."""
+    tc = get_task_config(quest)
+    if not tc or "tasks" not in tc:
+        return []
+    return list(tc["tasks"].keys())
+
 def get_seconds_needed(quest: dict) -> int:
     tc = get_task_config(quest)
     task_type = get_task_type(quest)
@@ -280,9 +311,7 @@ def get_seconds_done(quest: dict) -> float:
     if not task_type:
         return 0
     us = get_user_status(quest)
-    progress = us.get("progress", {})
-    if not progress:
-        progress = {}
+    progress = us.get("progress") or {}
     return progress.get(task_type, {}).get("value", 0)
 
 def get_enrolled_at(quest: dict) -> Optional[str]:
@@ -315,8 +344,8 @@ class QuestAutocompleter:
                 return []
             elif r.status_code == 429:
                 retry_after = r.json().get("retry_after", 10)
-                log(f"Rate limited – waiting {retry_after}s", "warn")
-                time.sleep(retry_after)
+                log(f"Rate limited – waiting {retry_after:.1f}s", "warn")
+                time.sleep(retry_after + random.uniform(0.5, 2.0))
                 return self.fetch_quests()
             else:
                 log(f"Quest fetch error ({r.status_code}): {r.text[:200]}", "warn")
@@ -327,12 +356,14 @@ class QuestAutocompleter:
                 traceback.print_exc()
             return []
 
-    # ── Auto-accept ────────────────────────────────────────────────────────────
+    # ── Enroll ─────────────────────────────────────────────────────────────────
     def enroll_quest(self, quest: dict) -> bool:
         name = get_quest_name(quest)
         qid = quest["id"]
         for attempt in range(1, 4):
             try:
+                # Small random delay before enrolling
+                human_sleep(random.uniform(1.5, 4.0), pct=0.1)
                 r = self.api.post(f"/quests/{qid}/enroll", {
                     "location": 11,
                     "is_targeted": False,
@@ -342,13 +373,12 @@ class QuestAutocompleter:
                     "traffic_metadata_sealed": quest.get("traffic_metadata_sealed"),
                 })
                 if r.status_code == 429:
-                    retry_after = r.json().get("retry_after", 5)
-                    wait = retry_after + 1
-                    log(f"Rate limited enrolling \"{name}\" (attempt {attempt}/3) – waiting {wait}s", "warn")
+                    wait = r.json().get("retry_after", 5) + random.uniform(1, 3)
+                    log(f"Rate limited enrolling \"{name}\" (attempt {attempt}/3) – waiting {wait:.1f}s", "warn")
                     time.sleep(wait)
                     continue
                 if r.status_code in (200, 201, 204):
-                    log(f"Enrolled: {Colors.BOLD}{name}{Colors.RESET}", "ok")
+                    log(f"Enrolled: {C.BOLD}{name}{C.RESET}", "ok")
                     return True
                 log(f"Enroll \"{name}\" failed ({r.status_code}): {r.text[:200]}", "warn")
                 return False
@@ -367,123 +397,86 @@ class QuestAutocompleter:
         ]
         if not unaccepted:
             return quests
-        log(f"Found {len(unaccepted)} unenrolled quests – auto‑accepting...", "info")
+        log(f"Found {len(unaccepted)} unenrolled quest(s) – auto-accepting...", "info")
         for q in unaccepted:
             self.enroll_quest(q)
-            time.sleep(3)
-        time.sleep(2)
+            human_sleep(random.uniform(2, 5))
+        human_sleep(2)
         return self.fetch_quests()
 
-    # ── Complete: WATCH_VIDEO ──────────────────────────────────────────────────
+    # ── Complete: WATCH_VIDEO* ─────────────────────────────────────────────────
     def complete_video(self, quest: dict):
         name = get_quest_name(quest)
         qid = quest["id"]
         seconds_needed = get_seconds_needed(quest)
-        seconds_done = get_seconds_done(quest)
+        seconds_done   = get_seconds_done(quest)
+
         enrolled_at_str = get_enrolled_at(quest)
-        if enrolled_at_str:
-            enrolled_ts = datetime.fromisoformat(enrolled_at_str.replace("Z", "+00:00")).timestamp()
-        else:
-            enrolled_ts = time.time()
-        log(f"🎬 Video: {Colors.BOLD}{name}{Colors.RESET} ({seconds_done:.0f}/{seconds_needed}s)", "info")
-        max_future = 10
-        speed = 7
-        interval = 1
+        enrolled_ts = (
+            datetime.fromisoformat(enrolled_at_str.replace("Z", "+00:00")).timestamp()
+            if enrolled_at_str else time.time()
+        )
+
+        log(f"🎬 Video: {C.BOLD}{name}{C.RESET} ({seconds_done:.0f}/{seconds_needed}s)", "info")
+
+        max_future = random.uniform(8, 14)           # how far ahead of real time we can report
+        speed      = random.uniform(5.5, 8.5)        # seconds of progress per tick
+        interval   = jitter(1.0, 0.3)               # real-time between ticks
+
         while seconds_done < seconds_needed:
             max_allowed = (time.time() - enrolled_ts) + max_future
-            diff = max_allowed - seconds_done
-            timestamp = seconds_done + speed
+            diff        = max_allowed - seconds_done
             if diff >= speed:
+                # Add tiny random noise to the timestamp
+                timestamp = min(seconds_needed, seconds_done + speed + random.uniform(0, 0.5))
                 try:
-                    r = self.api.post(f"/quests/{qid}/video-progress", {
-                        "timestamp": min(seconds_needed, timestamp + random.random())
-                    })
+                    r = self.api.post(f"/quests/{qid}/video-progress", {"timestamp": timestamp})
                     if r.status_code == 200:
                         body = r.json()
                         if body.get("completed_at"):
-                            log(f"✅ Completed: {Colors.BOLD}{name}{Colors.RESET}", "ok")
+                            log(f"✅ Completed: {C.BOLD}{name}{C.RESET}", "ok")
                             return
-                        seconds_done = min(seconds_needed, timestamp)
+                        seconds_done = timestamp
                         log(f"  [{name}] {seconds_done:.0f}/{seconds_needed}s", "progress")
                     elif r.status_code == 429:
-                        retry_after = r.json().get("retry_after", 5)
-                        log(f"  Rate limited – waiting {retry_after + 1}s", "warn")
-                        time.sleep(retry_after + 1)
+                        wait = r.json().get("retry_after", 5) + random.uniform(0.5, 2)
+                        log(f"  Rate limited – waiting {wait:.1f}s", "warn")
+                        time.sleep(wait)
                         continue
                     else:
                         log(f"  Video progress error ({r.status_code}): {r.text[:200]}", "warn")
                 except Exception as e:
                     log(f"  Error: {e}", "error")
-            if timestamp >= seconds_needed:
+            if seconds_done >= seconds_needed:
                 break
             time.sleep(interval)
+            interval = jitter(1.0, 0.3)   # re-randomise each tick
+
+        # Final flush
         try:
             self.api.post(f"/quests/{qid}/video-progress", {"timestamp": seconds_needed})
         except Exception:
             pass
-        log(f"✅ Completed: {Colors.BOLD}{name}{Colors.RESET}", "ok")
+        log(f"✅ Completed: {C.BOLD}{name}{C.RESET}", "ok")
 
-    # ── Complete: PLAY_ON_DESKTOP / STREAM_ON_DESKTOP ──────────────────────────
+    # ── Complete: PLAY_ON_DESKTOP / STREAM_ON_DESKTOP / PLAY_ON_MOBILE ─────────
     def complete_heartbeat(self, quest: dict):
-        name = get_quest_name(quest)
-        qid = quest["id"]
-        task_type = get_task_type(quest)
+        name         = get_quest_name(quest)
+        qid          = quest["id"]
+        task_type    = get_task_type(quest)
         seconds_needed = get_seconds_needed(quest)
-        seconds_done = get_seconds_done(quest)
-        remaining = max(0, seconds_needed - seconds_done)
+        seconds_done   = get_seconds_done(quest)
+        remaining    = max(0, seconds_needed - seconds_done)
         log(
-            f"🎮 {task_type}: {Colors.BOLD}{name}{Colors.RESET} "
-            f"(~{remaining // 60} minutes remaining)",
+            f"🎮 {task_type}: {C.BOLD}{name}{C.RESET} "
+            f"(~{remaining // 60}m remaining)",
             "info"
         )
-        pid = random.randint(1000, 30000)
-        while seconds_done < seconds_needed:
-            try:
-                r = self.api.post(f"/quests/{qid}/heartbeat", {
-                    "stream_key": f"call:0:{pid}",
-                    "terminal": False,
-                })
-                if r.status_code == 200:
-                    body = r.json()
-                    progress_data = body.get("progress", {})
-                    if progress_data and task_type in progress_data:
-                        seconds_done = progress_data[task_type].get("value", seconds_done)
-                    log(f"  [{name}] {seconds_done:.0f}/{seconds_needed}s", "progress")
-                    if body.get("completed_at") or seconds_done >= seconds_needed:
-                        log(f"✅ Completed: {Colors.BOLD}{name}{Colors.RESET}", "ok")
-                        return
-                elif r.status_code == 429:
-                    retry_after = r.json().get("retry_after", 10)
-                    log(f"  Rate limited – waiting {retry_after + 1}s", "warn")
-                    time.sleep(retry_after + 1)
-                    continue
-                else:
-                    log(f"  Heartbeat error ({r.status_code}): {r.text[:200]}", "warn")
-            except Exception as e:
-                log(f"  Heartbeat error: {e}", "error")
-            time.sleep(HEARTBEAT_INTERVAL)
-        try:
-            self.api.post(f"/quests/{qid}/heartbeat", {
-                "stream_key": f"call:0:{pid}",
-                "terminal": True,
-            })
-        except Exception:
-            pass
-        log(f"✅ Completed: {Colors.BOLD}{name}{Colors.RESET}", "ok")
+        # Randomise PID and stream-key format to look more real
+        pid        = random.randint(1000, 30000)
+        channel_id = random.randint(10**17, 10**18 - 1)
+        stream_key = f"call:{channel_id}:{pid}"
 
-    # ── Complete: PLAY_ACTIVITY ────────────────────────────────────────────────
-    def complete_activity(self, quest: dict):
-        name = get_quest_name(quest)
-        qid = quest["id"]
-        seconds_needed = get_seconds_needed(quest)
-        seconds_done = get_seconds_done(quest)
-        remaining = max(0, seconds_needed - seconds_done)
-        log(
-            f"🕹️  Activity: {Colors.BOLD}{name}{Colors.RESET} "
-            f"(~{remaining // 60} minutes remaining)",
-            "info"
-        )
-        stream_key = "call:0:1"
         while seconds_done < seconds_needed:
             try:
                 r = self.api.post(f"/quests/{qid}/heartbeat", {
@@ -491,23 +484,27 @@ class QuestAutocompleter:
                     "terminal": False,
                 })
                 if r.status_code == 200:
-                    body = r.json()
+                    body          = r.json()
                     progress_data = body.get("progress", {})
-                    if progress_data and "PLAY_ACTIVITY" in progress_data:
-                        seconds_done = progress_data["PLAY_ACTIVITY"].get("value", seconds_done)
+                    if progress_data and task_type in progress_data:
+                        seconds_done = progress_data[task_type].get("value", seconds_done)
                     log(f"  [{name}] {seconds_done:.0f}/{seconds_needed}s", "progress")
                     if body.get("completed_at") or seconds_done >= seconds_needed:
+                        log(f"✅ Completed: {C.BOLD}{name}{C.RESET}", "ok")
                         break
                 elif r.status_code == 429:
-                    retry_after = r.json().get("retry_after", 10)
-                    log(f"  Rate limited – waiting {retry_after + 1}s", "warn")
-                    time.sleep(retry_after + 1)
+                    wait = r.json().get("retry_after", 10) + random.uniform(0.5, 2)
+                    log(f"  Rate limited – waiting {wait:.1f}s", "warn")
+                    time.sleep(wait)
                     continue
                 else:
                     log(f"  Heartbeat error ({r.status_code}): {r.text[:200]}", "warn")
             except Exception as e:
-                log(f"  Error: {e}", "error")
-            time.sleep(HEARTBEAT_INTERVAL)
+                log(f"  Heartbeat error: {e}", "error")
+
+            human_sleep(HEARTBEAT_INTERVAL, pct=0.15)   # ±15% jitter on interval
+
+        # Terminal heartbeat
         try:
             self.api.post(f"/quests/{qid}/heartbeat", {
                 "stream_key": stream_key,
@@ -515,31 +512,104 @@ class QuestAutocompleter:
             })
         except Exception:
             pass
-        log(f"✅ Completed: {Colors.BOLD}{name}{Colors.RESET}", "ok")
+        log(f"✅ Completed: {C.BOLD}{name}{C.RESET}", "ok")
+
+    # ── Complete: PLAY_ACTIVITY ────────────────────────────────────────────────
+    def complete_activity(self, quest: dict):
+        name           = get_quest_name(quest)
+        qid            = quest["id"]
+        seconds_needed = get_seconds_needed(quest)
+        seconds_done   = get_seconds_done(quest)
+        remaining      = max(0, seconds_needed - seconds_done)
+        log(
+            f"🕹️  Activity: {C.BOLD}{name}{C.RESET} "
+            f"(~{remaining // 60}m remaining)",
+            "info"
+        )
+        channel_id = random.randint(10**17, 10**18 - 1)
+        stream_key = f"call:{channel_id}:1"
+
+        while seconds_done < seconds_needed:
+            try:
+                r = self.api.post(f"/quests/{qid}/heartbeat", {
+                    "stream_key": stream_key,
+                    "terminal": False,
+                })
+                if r.status_code == 200:
+                    body          = r.json()
+                    progress_data = body.get("progress", {})
+                    if progress_data and "PLAY_ACTIVITY" in progress_data:
+                        seconds_done = progress_data["PLAY_ACTIVITY"].get("value", seconds_done)
+                    log(f"  [{name}] {seconds_done:.0f}/{seconds_needed}s", "progress")
+                    if body.get("completed_at") or seconds_done >= seconds_needed:
+                        break
+                elif r.status_code == 429:
+                    wait = r.json().get("retry_after", 10) + random.uniform(0.5, 2)
+                    log(f"  Rate limited – waiting {wait:.1f}s", "warn")
+                    time.sleep(wait)
+                    continue
+                else:
+                    log(f"  Heartbeat error ({r.status_code}): {r.text[:200]}", "warn")
+            except Exception as e:
+                log(f"  Error: {e}", "error")
+            human_sleep(HEARTBEAT_INTERVAL, pct=0.15)
+
+        try:
+            self.api.post(f"/quests/{qid}/heartbeat", {
+                "stream_key": stream_key,
+                "terminal": True,
+            })
+        except Exception:
+            pass
+        log(f"✅ Completed: {C.BOLD}{name}{C.RESET}", "ok")
 
     # ── Process a single quest ─────────────────────────────────────────────────
     def process_quest(self, quest: dict):
-        qid = quest.get("id")
-        name = get_quest_name(quest)
+        qid       = quest.get("id")
+        name      = get_quest_name(quest)
         task_type = get_task_type(quest)
-        if not task_type:
-            log(f"\"{name}\" – unsupported task, skipping", "warn")
-            return
+
         if qid in self.completed_ids:
             return
-        log(f"━━━ Starting: {Colors.BOLD}{name}{Colors.RESET} (task: {task_type}) ━━━", "info")
-        if task_type in ("WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE"):
+
+        if not task_type:
+            # ── [?] quest diagnosis ──
+            raw_keys = get_raw_task_keys(quest)
+            if raw_keys:
+                log(
+                    f"❓ \"{name}\" has unknown task type(s): {raw_keys}  "
+                    f"→ not yet supported, skipping.",
+                    "warn"
+                )
+                log(
+                    f"   Tip: add '{raw_keys[0]}' to SUPPORTED_TASKS + HEARTBEAT_TASKS "
+                    f"or VIDEO_TASKS at the top of this file to enable it.",
+                    "info"
+                )
+            else:
+                log(f"❓ \"{name}\" – no tasks found in config, skipping", "warn")
+            return
+
+        log(f"━━━ Starting: {C.BOLD}{name}{C.RESET} (task: {task_type}) ━━━", "info")
+
+        if task_type in VIDEO_TASKS:
             self.complete_video(quest)
-        elif task_type in ("PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP"):
+        elif task_type in HEARTBEAT_TASKS:
             self.complete_heartbeat(quest)
         elif task_type == "PLAY_ACTIVITY":
             self.complete_activity(quest)
+        else:
+            log(f"  No handler for {task_type}, skipping", "warn")
+            return
+
         self.completed_ids.add(qid)
+        # Random cooldown between quests
+        human_sleep(random.uniform(3, 8))
 
     # ── Main loop ──────────────────────────────────────────────────────────────
     def run(self):
         log("=" * 60, "info")
-        log(f"{Colors.BOLD}Discord Quest Auto-Completer v3.0{Colors.RESET}", "info")
+        log(f"{C.BOLD}Discord Quest Auto-Completer (improved){C.RESET}", "info")
         log(f"Auto-accept: {'ON' if AUTO_ACCEPT else 'OFF'}  |  Poll: {POLL_INTERVAL}s", "info")
         log("=" * 60, "info")
         cycle = 0
@@ -547,34 +617,40 @@ class QuestAutocompleter:
             cycle += 1
             log(f"── Scan #{cycle} ──", "info")
             quests = self.fetch_quests()
-            total = len(quests)
             if not quests:
                 log("No quests found", "info")
             else:
-                enrolled_count = sum(1 for q in quests if is_enrolled(q))
-                completed_count = sum(1 for q in quests if is_completed(q))
+                total            = len(quests)
+                enrolled_count   = sum(1 for q in quests if is_enrolled(q))
+                completed_count  = sum(1 for q in quests if is_completed(q))
                 completable_count = sum(1 for q in quests if is_completable(q))
                 log(
-                    f"Total: {total} quests | Enrolled: {enrolled_count} | "
+                    f"Total: {total} | Enrolled: {enrolled_count} | "
                     f"Completed: {completed_count} | Completable: {completable_count}",
                     "info"
                 )
                 for q in quests:
-                    name = get_quest_name(q)
-                    task = get_task_type(q) or "?"
-                    if is_completed(q):
-                        status = f"{Colors.GREEN}✓{Colors.RESET}"
-                    elif is_enrolled(q):
-                        status = f"{Colors.YELLOW}▶{Colors.RESET}"
+                    name  = get_quest_name(q)
+                    task  = get_task_type(q)
+                    if task:
+                        task_label = task
                     else:
-                        status = f"{Colors.DIM}○{Colors.RESET}"
-                    log(f"  {status} {name} [{task}]", "info")
-                # Auto-accept
-                quests = self.auto_accept(quests)
-                # Filter actionable
+                        raw = get_raw_task_keys(q)
+                        task_label = f"? ({', '.join(raw)})" if raw else "?"
+                    if is_completed(q):
+                        status = f"{C.GREEN}✓{C.RESET}"
+                    elif is_enrolled(q):
+                        status = f"{C.YELLOW}▶{C.RESET}"
+                    else:
+                        status = f"{C.DIM}○{C.RESET}"
+                    log(f"  {status} {name} [{task_label}]", "info")
+
+                quests    = self.auto_accept(quests)
                 actionable = [
                     q for q in quests
-                    if is_enrolled(q) and not is_completed(q) and is_completable(q)
+                    if is_enrolled(q)
+                    and not is_completed(q)
+                    and is_completable(q)
                     and q.get("id") not in self.completed_ids
                 ]
                 if actionable:
@@ -583,19 +659,22 @@ class QuestAutocompleter:
                         self.process_quest(q)
                 else:
                     log("No quests need completion at this time", "info")
-            log(f"\nWaiting {POLL_INTERVAL}s... (Ctrl+C to stop)\n", "info")
-            time.sleep(POLL_INTERVAL)
+
+            # Jitter the poll interval slightly so requests don't land on exact clock marks
+            wait = jitter(POLL_INTERVAL, 0.10)
+            log(f"\nWaiting {wait:.0f}s... (Ctrl+C to stop)\n", "info")
+            time.sleep(wait)
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 def main():
     print(f"""
-{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════╗
-║     Discord Quest Auto-Completer.            ║
+{C.BOLD}{C.CYAN}╔══════════════════════════════════════════════╗
+║     Discord Quest Auto-Completer             ║
 ║  Auto‑scan · Auto‑enroll · Auto‑complete     ║
-╚══════════════════════════════════════════════╝{Colors.RESET}
+╚══════════════════════════════════════════════╝{C.RESET}
 """)
     build_number = fetch_latest_build_number()
-    api = DiscordAPI(TOKEN, build_number)
+    api          = DiscordAPI(TOKEN, build_number)
     if not api.validate_token():
         sys.exit(1)
     completer = QuestAutocompleter(api)
