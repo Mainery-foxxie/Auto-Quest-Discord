@@ -304,23 +304,30 @@ def get_raw_task_keys(quest: dict) -> list:
         return []
     return list(tc["tasks"].keys())
 
-def get_achievement_info(quest: dict) -> tuple:
+def get_activity_quest_info(quest: dict) -> dict:
     """
-    Extract (application_id, achievement_id) for ACHIEVEMENT_IN_ACTIVITY quests.
-    Returns (None, None) if not found.
+    Extract info for ACHIEVEMENT_IN_ACTIVITY quests.
+    Returns dict with: app_id, event_name, target (how many times to fire).
     """
     tc = get_task_config(quest)
     if not tc:
-        return None, None
-    tasks = tc.get("tasks", {})
-    task_data = tasks.get("ACHIEVEMENT_IN_ACTIVITY", {})
-    # Discord embeds app/achievement IDs in the task config
-    app_id  = (
-        _get(task_data, "applicationId", "application_id")
-        or quest.get("config", {}).get("application", {}).get("id")
-    )
-    ach_id  = _get(task_data, "achievementId", "achievement_id", "id")
-    return app_id, ach_id
+        return {}
+    task_data = tc.get("tasks", {}).get("ACHIEVEMENT_IN_ACTIVITY", {})
+
+    # application_id lives inside an "applications" list
+    app_id = None
+    apps = task_data.get("applications") or []
+    if apps and isinstance(apps, list):
+        app_id = apps[0].get("id")
+    # fallback: top-level application in config
+    if not app_id:
+        app_id = quest.get("config", {}).get("application", {}).get("id")
+
+    return {
+        "app_id":     app_id,
+        "event_name": task_data.get("event_name", "progress"),
+        "target":     task_data.get("target", 1),
+    }
 
 def get_seconds_needed(quest: dict) -> int:
     tc = get_task_config(quest)
@@ -588,61 +595,124 @@ class QuestAutocompleter:
 
     # ── Complete: ACHIEVEMENT_IN_ACTIVITY ─────────────────────────────────────
     def complete_achievement(self, quest: dict):
-        name   = get_quest_name(quest)
-        qid    = quest["id"]
-        app_id, ach_id = get_achievement_info(quest)
+        name = get_quest_name(quest)
+        qid  = quest["id"]
+        info = get_activity_quest_info(quest)
 
-        if not app_id or not ach_id:
-            # IDs missing — dump raw task config so user can inspect
+        app_id     = info.get("app_id")
+        event_name = info.get("event_name", "progress")
+        target     = int(info.get("target", 1))
+
+        if not app_id:
             tc = get_task_config(quest)
-            log(f"❌ \"{name}\": can't find application_id / achievement_id in task config.", "error")
+            log(f"❌ \"{name}\": can't find application_id in task config.", "error")
             log(f"   Raw task config: {json.dumps(tc, indent=2)[:600]}", "warn")
             return
 
-        log(f"🏆 Achievement: {C.BOLD}{name}{C.RESET} (app={app_id} ach={ach_id})", "info")
+        log(
+            f"🏆 Achievement: {C.BOLD}{name}{C.RESET} "
+            f"(app={app_id}  event={event_name}  target={target}x)",
+            "info"
+        )
 
-        # Attempt 1 – PATCH percent_complete to 100 on the user achievement endpoint
-        for attempt in range(1, 4):
-            try:
-                human_sleep(random.uniform(1.0, 2.5))
-                r = self.api.session.patch(
-                    f"https://discord.com/api/v9/users/@me/applications/{app_id}/achievements/{ach_id}",
-                    json={"percent_complete": 100},
-                )
-                log(f"  PATCH achievement -> {r.status_code}", "debug")
-                if r.status_code in (200, 201, 204):
-                    log(f"✅ Completed: {C.BOLD}{name}{C.RESET}", "ok")
-                    return
-                if r.status_code == 404:
-                    # Achievement endpoint not accessible – fall through to quest-complete
-                    log(f"  Achievement endpoint 404, trying quest-complete fallback...", "warn")
-                    break
-                if r.status_code == 429:
-                    wait = r.json().get("retry_after", 5) + random.uniform(0.5, 2)
-                    log(f"  Rate limited – waiting {wait:.1f}s", "warn")
-                    time.sleep(wait)
+        # Progress already done
+        us = get_user_status(quest)
+        already = int(
+            (us.get("progress") or {})
+            .get("ACHIEVEMENT_IN_ACTIVITY", {})
+            .get("value", 0)
+        )
+        remaining_fires = max(0, target - already)
+        log(f"  Progress: {already}/{target} — need to fire {remaining_fires} more event(s)", "info")
+
+        if remaining_fires == 0:
+            log(f"✅ Already completed: {C.BOLD}{name}{C.RESET}", "ok")
+            return
+
+        # Candidate endpoints — tried in order until one succeeds
+        endpoints = [
+            # Most likely: activity-progress with event payload
+            (
+                "POST",
+                f"/quests/{qid}/activity-progress",
+                {"application_id": app_id, "event_name": event_name},
+            ),
+            # Fallback: event endpoint
+            (
+                "POST",
+                f"/quests/{qid}/event",
+                {"application_id": app_id, "event": event_name},
+            ),
+            # Fallback: heartbeat with app context
+            (
+                "POST",
+                f"/quests/{qid}/heartbeat",
+                {"application_id": app_id, "event_name": event_name, "terminal": False},
+            ),
+            # Last resort: direct complete
+            (
+                "POST",
+                f"/quests/{qid}/complete",
+                None,
+            ),
+        ]
+
+        fired = already
+        for i in range(remaining_fires):
+            success = False
+            for method, path, payload in endpoints:
+                try:
+                    human_sleep(random.uniform(1.5, 3.5))
+                    r = self.api.post(path, payload)
+                    log(f"  Fire #{fired + 1} via {path} -> {r.status_code}", "debug")
+
+                    if r.status_code in (200, 201, 204):
+                        body = r.json() if r.content else {}
+                        fired += 1
+                        log(f"  Event fired ({fired}/{target})", "progress")
+                        # Check if Discord already marks it complete
+                        if body.get("completed_at"):
+                            log(f"✅ Completed: {C.BOLD}{name}{C.RESET}", "ok")
+                            return
+                        success = True
+                        # Stick with whichever endpoint worked
+                        endpoints = [(method, path, payload)]
+                        break
+                    elif r.status_code == 429:
+                        wait = r.json().get("retry_after", 5) + random.uniform(0.5, 2)
+                        log(f"  Rate limited – waiting {wait:.1f}s", "warn")
+                        time.sleep(wait)
+                        # retry same endpoint
+                        success = None  # signal: retry outer loop
+                        break
+                    elif r.status_code == 403:
+                        log(f"  {path} -> 403, trying next endpoint...", "debug")
+                        continue   # try next candidate
+                    else:
+                        log(f"  {path} -> {r.status_code}: {r.text[:200]}", "warn")
+                        continue
+
+                except Exception as e:
+                    log(f"  Error on {path}: {e}", "error")
                     continue
-                log(f"  Achievement PATCH error ({r.status_code}): {r.text[:300]}", "warn")
-                break
-            except Exception as e:
-                log(f"  Error: {e}", "error")
-                break
 
-        # Attempt 2 – POST to /quests/{id}/complete directly
-        try:
-            human_sleep(random.uniform(0.8, 2.0))
-            r2 = self.api.post(f"/quests/{qid}/complete")
-            if r2.status_code in (200, 201, 204):
-                log(f"✅ Completed (via quest-complete): {C.BOLD}{name}{C.RESET}", "ok")
+            if success is None:
+                # Was rate-limited — redo this fire iteration
+                i -= 1
+                continue
+            if not success:
+                log(
+                    f"⚠️  All endpoints failed for \"{name}\".\n"
+                    f"   This quest likely requires earning the achievement inside the "
+                    f"Discord Activity ({event_name} × {target}) in-game.",
+                    "warn"
+                )
                 return
-            log(
-                f"  Quest-complete fallback also failed ({r2.status_code}): {r2.text[:300]}\n"
-                f"  ⚠️  \"{name}\" requires earning the achievement in-game. "
-                f"Open Discord, launch the Activity, and earn it manually.",
-                "warn"
-            )
-        except Exception as e:
-            log(f"  Quest-complete error: {e}", "error")
+
+        if fired >= target:
+            log(f"✅ Completed: {C.BOLD}{name}{C.RESET}", "ok")
+        else:
+            log(f"⚠️  Only fired {fired}/{target} events for \"{name}\"", "warn")
 
     # ── Process a single quest ─────────────────────────────────────────────────
     def process_quest(self, quest: dict):
