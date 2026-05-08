@@ -595,124 +595,38 @@ class QuestAutocompleter:
 
     # ── Complete: ACHIEVEMENT_IN_ACTIVITY ─────────────────────────────────────
     def complete_achievement(self, quest: dict):
-        name = get_quest_name(quest)
-        qid  = quest["id"]
-        info = get_activity_quest_info(quest)
-
-        app_id     = info.get("app_id")
+        """
+        ACHIEVEMENT_IN_ACTIVITY quests are gated by the Discord Activities SDK.
+        Progress is only accepted from a live in-game session — no REST endpoint
+        exists to complete these externally. Skip and guide the user.
+        """
+        name       = get_quest_name(quest)
+        info       = get_activity_quest_info(quest)
+        app_id     = info.get("app_id", "?")
         event_name = info.get("event_name", "progress")
-        target     = int(info.get("target", 1))
+        target     = info.get("target", 1)
 
-        if not app_id:
-            tc = get_task_config(quest)
-            log(f"❌ \"{name}\": can't find application_id in task config.", "error")
-            log(f"   Raw task config: {json.dumps(tc, indent=2)[:600]}", "warn")
-            return
-
-        log(
-            f"🏆 Achievement: {C.BOLD}{name}{C.RESET} "
-            f"(app={app_id}  event={event_name}  target={target}x)",
-            "info"
-        )
-
-        # Progress already done
-        us = get_user_status(quest)
+        us      = get_user_status(quest)
         already = int(
             (us.get("progress") or {})
             .get("ACHIEVEMENT_IN_ACTIVITY", {})
             .get("value", 0)
         )
-        remaining_fires = max(0, target - already)
-        log(f"  Progress: {already}/{target} — need to fire {remaining_fires} more event(s)", "info")
 
-        if remaining_fires == 0:
-            log(f"✅ Already completed: {C.BOLD}{name}{C.RESET}", "ok")
-            return
-
-        # Candidate endpoints — tried in order until one succeeds
-        endpoints = [
-            # Most likely: activity-progress with event payload
-            (
-                "POST",
-                f"/quests/{qid}/activity-progress",
-                {"application_id": app_id, "event_name": event_name},
-            ),
-            # Fallback: event endpoint
-            (
-                "POST",
-                f"/quests/{qid}/event",
-                {"application_id": app_id, "event": event_name},
-            ),
-            # Fallback: heartbeat with app context
-            (
-                "POST",
-                f"/quests/{qid}/heartbeat",
-                {"application_id": app_id, "event_name": event_name, "terminal": False},
-            ),
-            # Last resort: direct complete
-            (
-                "POST",
-                f"/quests/{qid}/complete",
-                None,
-            ),
-        ]
-
-        fired = already
-        for i in range(remaining_fires):
-            success = False
-            for method, path, payload in endpoints:
-                try:
-                    human_sleep(random.uniform(1.5, 3.5))
-                    r = self.api.post(path, payload)
-                    log(f"  Fire #{fired + 1} via {path} -> {r.status_code}", "debug")
-
-                    if r.status_code in (200, 201, 204):
-                        body = r.json() if r.content else {}
-                        fired += 1
-                        log(f"  Event fired ({fired}/{target})", "progress")
-                        # Check if Discord already marks it complete
-                        if body.get("completed_at"):
-                            log(f"✅ Completed: {C.BOLD}{name}{C.RESET}", "ok")
-                            return
-                        success = True
-                        # Stick with whichever endpoint worked
-                        endpoints = [(method, path, payload)]
-                        break
-                    elif r.status_code == 429:
-                        wait = r.json().get("retry_after", 5) + random.uniform(0.5, 2)
-                        log(f"  Rate limited – waiting {wait:.1f}s", "warn")
-                        time.sleep(wait)
-                        # retry same endpoint
-                        success = None  # signal: retry outer loop
-                        break
-                    elif r.status_code == 403:
-                        log(f"  {path} -> 403, trying next endpoint...", "debug")
-                        continue   # try next candidate
-                    else:
-                        log(f"  {path} -> {r.status_code}: {r.text[:200]}", "warn")
-                        continue
-
-                except Exception as e:
-                    log(f"  Error on {path}: {e}", "error")
-                    continue
-
-            if success is None:
-                # Was rate-limited — redo this fire iteration
-                i -= 1
-                continue
-            if not success:
-                log(
-                    f"⚠️  All endpoints failed for \"{name}\".\n"
-                    f"   This quest likely requires earning the achievement inside the "
-                    f"Discord Activity ({event_name} × {target}) in-game.",
-                    "warn"
-                )
-                return
-
-        if fired >= target:
-            log(f"✅ Completed: {C.BOLD}{name}{C.RESET}", "ok")
-        else:
-            log(f"⚠️  Only fired {fired}/{target} events for \"{name}\"", "warn")
+        log(
+            f"⏭️  Skipping \"{C.BOLD}{name}{C.RESET}\" "
+            f"[ACHIEVEMENT_IN_ACTIVITY — manual only]",
+            "warn"
+        )
+        log(
+            f"   Progress: {already}/{target}  |  event: {event_name}  |  app: {app_id}",
+            "info"
+        )
+        log(
+            f"   ↳ Open Discord → find the Activity for this quest → "
+            f"play until the '{event_name}' event fires {target - already} more time(s).",
+            "info"
+        )
 
     # ── Process a single quest ─────────────────────────────────────────────────
     def process_quest(self, quest: dict):
@@ -750,6 +664,7 @@ class QuestAutocompleter:
             self.complete_heartbeat(quest)
         elif task_type in ACHIEVEMENT_TASKS:
             self.complete_achievement(quest)
+            return   # don't add to completed_ids — re-check progress each scan
         else:
             log(f"  No handler for {task_type}, skipping", "warn")
             return
