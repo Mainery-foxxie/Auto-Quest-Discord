@@ -61,6 +61,9 @@ HEARTBEAT_TASKS = {
     "STREAM_ON_DESKTOP",
     "PLAY_ACTIVITY",
     "PLAY_ON_MOBILE",
+}
+
+ACHIEVEMENT_TASKS = {
     "ACHIEVEMENT_IN_ACTIVITY",
 }
 VIDEO_TASKS = {
@@ -300,6 +303,24 @@ def get_raw_task_keys(quest: dict) -> list:
     if not tc or "tasks" not in tc:
         return []
     return list(tc["tasks"].keys())
+
+def get_achievement_info(quest: dict) -> tuple:
+    """
+    Extract (application_id, achievement_id) for ACHIEVEMENT_IN_ACTIVITY quests.
+    Returns (None, None) if not found.
+    """
+    tc = get_task_config(quest)
+    if not tc:
+        return None, None
+    tasks = tc.get("tasks", {})
+    task_data = tasks.get("ACHIEVEMENT_IN_ACTIVITY", {})
+    # Discord embeds app/achievement IDs in the task config
+    app_id  = (
+        _get(task_data, "applicationId", "application_id")
+        or quest.get("config", {}).get("application", {}).get("id")
+    )
+    ach_id  = _get(task_data, "achievementId", "achievement_id", "id")
+    return app_id, ach_id
 
 def get_seconds_needed(quest: dict) -> int:
     tc = get_task_config(quest)
@@ -565,6 +586,64 @@ class QuestAutocompleter:
             pass
         log(f"✅ Completed: {C.BOLD}{name}{C.RESET}", "ok")
 
+    # ── Complete: ACHIEVEMENT_IN_ACTIVITY ─────────────────────────────────────
+    def complete_achievement(self, quest: dict):
+        name   = get_quest_name(quest)
+        qid    = quest["id"]
+        app_id, ach_id = get_achievement_info(quest)
+
+        if not app_id or not ach_id:
+            # IDs missing — dump raw task config so user can inspect
+            tc = get_task_config(quest)
+            log(f"❌ \"{name}\": can't find application_id / achievement_id in task config.", "error")
+            log(f"   Raw task config: {json.dumps(tc, indent=2)[:600]}", "warn")
+            return
+
+        log(f"🏆 Achievement: {C.BOLD}{name}{C.RESET} (app={app_id} ach={ach_id})", "info")
+
+        # Attempt 1 – PATCH percent_complete to 100 on the user achievement endpoint
+        for attempt in range(1, 4):
+            try:
+                human_sleep(random.uniform(1.0, 2.5))
+                r = self.api.session.patch(
+                    f"https://discord.com/api/v9/users/@me/applications/{app_id}/achievements/{ach_id}",
+                    json={"percent_complete": 100},
+                )
+                log(f"  PATCH achievement -> {r.status_code}", "debug")
+                if r.status_code in (200, 201, 204):
+                    log(f"✅ Completed: {C.BOLD}{name}{C.RESET}", "ok")
+                    return
+                if r.status_code == 404:
+                    # Achievement endpoint not accessible – fall through to quest-complete
+                    log(f"  Achievement endpoint 404, trying quest-complete fallback...", "warn")
+                    break
+                if r.status_code == 429:
+                    wait = r.json().get("retry_after", 5) + random.uniform(0.5, 2)
+                    log(f"  Rate limited – waiting {wait:.1f}s", "warn")
+                    time.sleep(wait)
+                    continue
+                log(f"  Achievement PATCH error ({r.status_code}): {r.text[:300]}", "warn")
+                break
+            except Exception as e:
+                log(f"  Error: {e}", "error")
+                break
+
+        # Attempt 2 – POST to /quests/{id}/complete directly
+        try:
+            human_sleep(random.uniform(0.8, 2.0))
+            r2 = self.api.post(f"/quests/{qid}/complete")
+            if r2.status_code in (200, 201, 204):
+                log(f"✅ Completed (via quest-complete): {C.BOLD}{name}{C.RESET}", "ok")
+                return
+            log(
+                f"  Quest-complete fallback also failed ({r2.status_code}): {r2.text[:300]}\n"
+                f"  ⚠️  \"{name}\" requires earning the achievement in-game. "
+                f"Open Discord, launch the Activity, and earn it manually.",
+                "warn"
+            )
+        except Exception as e:
+            log(f"  Quest-complete error: {e}", "error")
+
     # ── Process a single quest ─────────────────────────────────────────────────
     def process_quest(self, quest: dict):
         qid       = quest.get("id")
@@ -598,9 +677,9 @@ class QuestAutocompleter:
         if task_type in VIDEO_TASKS:
             self.complete_video(quest)
         elif task_type in HEARTBEAT_TASKS:
-            # HEARTBEAT_TASKS covers: PLAY_ON_DESKTOP, STREAM_ON_DESKTOP,
-            # PLAY_ACTIVITY, PLAY_ON_MOBILE, ACHIEVEMENT_IN_ACTIVITY
             self.complete_heartbeat(quest)
+        elif task_type in ACHIEVEMENT_TASKS:
+            self.complete_achievement(quest)
         else:
             log(f"  No handler for {task_type}, skipping", "warn")
             return
