@@ -52,6 +52,7 @@ SUPPORTED_TASKS = [
     # Additional types discovered via [?] quests – treated as heartbeat
     "PLAY_ON_MOBILE",
     "WATCH_VIDEO_ON_DESKTOP",
+    "ACHIEVEMENT_IN_ACTIVITY",
 ]
 
 # Task types that use heartbeat (play/stream) vs video-progress
@@ -60,6 +61,7 @@ HEARTBEAT_TASKS = {
     "STREAM_ON_DESKTOP",
     "PLAY_ACTIVITY",
     "PLAY_ON_MOBILE",
+    "ACHIEVEMENT_IN_ACTIVITY",
 }
 VIDEO_TASKS = {
     "WATCH_VIDEO",
@@ -590,14 +592,15 @@ class QuestAutocompleter:
                 log(f"❓ \"{name}\" – no tasks found in config, skipping", "warn")
             return
 
-        log(f"━━━ Starting: {C.BOLD}{name}{C.RESET} (task: {task_type}) ━━━", "info")
+        emoji = "🏆" if task_type == "ACHIEVEMENT_IN_ACTIVITY" else "━"
+        log(f"{emoji}━━ Starting: {C.BOLD}{name}{C.RESET} (task: {task_type}) ━━━", "info")
 
         if task_type in VIDEO_TASKS:
             self.complete_video(quest)
         elif task_type in HEARTBEAT_TASKS:
+            # HEARTBEAT_TASKS covers: PLAY_ON_DESKTOP, STREAM_ON_DESKTOP,
+            # PLAY_ACTIVITY, PLAY_ON_MOBILE, ACHIEVEMENT_IN_ACTIVITY
             self.complete_heartbeat(quest)
-        elif task_type == "PLAY_ACTIVITY":
-            self.complete_activity(quest)
         else:
             log(f"  No handler for {task_type}, skipping", "warn")
             return
