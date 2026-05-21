@@ -42,7 +42,7 @@ class QuestState:
     name:           str
     completed:      bool  = False
     last_update:    float = field(default_factory=time.time)
-    lock:           threading.Lock = field(default_factory=threading.Lock)
+    lock:           threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def advance(self, value: float):
         """Thread-safe progress update."""
@@ -241,6 +241,7 @@ class DiscordAPI:
     def __init__(self, token: str, build_number: int):
         self.token = token
         self.session = requests.Session()
+        self._lock = threading.Lock()   # serialize requests — session is not thread-safe
         ua = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -270,17 +271,18 @@ class DiscordAPI:
     def get(self, path: str, **kwargs) -> requests.Response:
         url = f"https://discord.com/api/v9{path}"
         log(f"GET {path}", "debug")
-        # Small random pre-request pause to mimic human timing
-        time.sleep(random.uniform(0.1, 0.4))
-        r = self.session.get(url, **kwargs)
+        with self._lock:
+            time.sleep(random.uniform(0.1, 0.4))
+            r = self.session.get(url, **kwargs)
         log(f"  -> {r.status_code}", "debug")
         return r
 
     def post(self, path: str, payload: Optional[dict] = None, **kwargs) -> requests.Response:
         url = f"https://discord.com/api/v9{path}"
         log(f"POST {path}", "debug")
-        time.sleep(random.uniform(0.1, 0.4))
-        r = self.session.post(url, json=payload, **kwargs)
+        with self._lock:
+            time.sleep(random.uniform(0.1, 0.4))
+            r = self.session.post(url, json=payload, **kwargs)
         log(f"  -> {r.status_code}", "debug")
         return r
 
@@ -420,7 +422,21 @@ def get_enrolled_at(quest: dict) -> Optional[str]:
 class QuestAutocompleter:
     def __init__(self, api: DiscordAPI):
         self.api = api
-        self.completed_ids: set = set()
+        self._completed_ids: set = set()
+        self._ids_lock = threading.Lock()
+
+    # ── Thread-safe completed_ids access ──────────────────────────────────────
+    @property
+    def completed_ids(self) -> set:
+        return self._completed_ids
+
+    def mark_completed(self, qid: str):
+        with self._ids_lock:
+            self._completed_ids.add(qid)
+
+    def is_already_done(self, qid: str) -> bool:
+        with self._ids_lock:
+            return qid in self._completed_ids
 
     # ── Fetch quests ───────────────────────────────────────────────────────────
     def fetch_quests(self) -> list:
@@ -458,7 +474,6 @@ class QuestAutocompleter:
                 return []
         return []
 
-    # ── Enroll ─────────────────────────────────────────────────────────────────
     # ── Enroll ─────────────────────────────────────────────────────────────────
     def enroll_quest(self, quest: dict) -> bool:
         """Enroll in a quest with up to 3 attempts, retrying on 429 or transient errors."""
@@ -581,7 +596,7 @@ class QuestAutocompleter:
                                 pass
                             log(f"✅ Video done: {C.BOLD}{state.name}{C.RESET}", "ok")
                             state.completed = True
-                            self.completed_ids.add(qid)
+                            self.mark_completed(qid)
                     elif r.status_code == 429:
                         _wait_for_rate_limit(r, context=state.name)
                     else:
@@ -593,38 +608,31 @@ class QuestAutocompleter:
                 break
             time.sleep(VIDEO_TICK_INTERVAL)
 
-    # ── Heartbeat group: all PLAY/STREAM quests round-robin with HB interval ──
+    # ── Heartbeat group: one thread per quest, each on its own interval ────────
     def _run_heartbeat_group(self, states: List[QuestState]):
         """
-        Send heartbeats round-robin across all active heartbeat quests.
-        Each quest gets its own stream_key; after each heartbeat we wait the
-        configured HEARTBEAT_INTERVAL before hitting the next quest.  This
-        mirrors the extension's heartbeatPromise behaviour.
-        """
-        log(f"🎮 Heartbeat group starting ({len(states)} quest(s))", "info")
+        Spawn one worker thread per heartbeat quest so every quest gets a
+        heartbeat every HEARTBEAT_INTERVAL seconds — independent of how many
+        other quests are running.
 
-        # Assign a stable stream_key per quest up front
-        stream_keys = {}
-        for s in states:
-            pid        = random.randint(1000, 30000)
+        Old round-robin: 2 quests × 20s interval = each quest heartbeats every 40s.
+        New per-thread:  2 quests × 20s interval = each quest heartbeats every 20s. ✓
+        """
+        log(f"🎮 Heartbeat group starting ({len(states)} quest(s), one thread each)", "info")
+
+        def _worker(state: QuestState):
+            qid = state.quest["id"]
+            pid = random.randint(1000, 30000)
             channel_id = random.randint(10**17, 10**18 - 1)
-            stream_keys[s.quest["id"]] = f"call:{channel_id}:{pid}"
-            emoji = "🕹️" if s.task_type == "PLAY_ACTIVITY" else "🎮"
+            stream_key = f"call:{channel_id}:{pid}"
+            emoji = "🕹️" if state.task_type == "PLAY_ACTIVITY" else "🎮"
             log(
-                f"   {emoji} {C.BOLD}{s.name}{C.RESET}  "
-                f"~{s.remaining // 60:.0f}m remaining  [{s.task_type}]",
+                f"   {emoji} {C.BOLD}{state.name}{C.RESET}  "
+                f"~{state.remaining // 60:.0f}m remaining  [{state.task_type}]",
                 "info"
             )
 
-        while True:
-            all_done = True
-            for state in states:
-                if state.completed:
-                    continue
-                all_done = False
-                qid        = state.quest["id"]
-                stream_key = stream_keys[qid]
-
+            while not state.completed:
                 try:
                     r = self.api.post(f"/quests/{qid}/heartbeat", {
                         "stream_key": stream_key,
@@ -641,7 +649,6 @@ class QuestAutocompleter:
                             "progress"
                         )
                         if body.get("completed_at") or state.completed:
-                            # Terminal heartbeat
                             try:
                                 self.api.post(f"/quests/{qid}/heartbeat", {
                                     "stream_key": stream_key,
@@ -651,23 +658,26 @@ class QuestAutocompleter:
                                 pass
                             log(f"✅ Heartbeat done: {C.BOLD}{state.name}{C.RESET}", "ok")
                             state.completed = True
-                            self.completed_ids.add(qid)
-                            continue
+                            self.mark_completed(qid)
+                            return
                     elif r.status_code == 429:
                         _wait_for_rate_limit(r, context=state.name)
-                        continue
+                        continue   # retry immediately without sleeping the full interval
                     else:
                         log(f"  Heartbeat error ({r.status_code}) [{state.name}]: {r.text[:200]}", "warn")
                 except Exception as e:
                     log(f"  Heartbeat error [{state.name}]: {e}", "error")
 
-                # Wait between heartbeats; skip wait if this was the last active quest
-                active_remaining = [s for s in states if not s.completed]
-                if active_remaining:
-                    human_sleep(HEARTBEAT_INTERVAL, pct=0.15)
+                human_sleep(HEARTBEAT_INTERVAL, pct=0.15)
 
-            if all_done:
-                break
+        workers = [
+            threading.Thread(target=_worker, args=(s,), name=f"HB-{s.name[:20]}", daemon=True)
+            for s in states
+        ]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join()
 
     # ── Complete: ACHIEVEMENT_IN_ACTIVITY ─────────────────────────────────────
     def _handle_achievement(self, quest: dict):
@@ -710,7 +720,7 @@ class QuestAutocompleter:
             task_type = get_task_type(quest)
             name      = get_quest_name(quest)
 
-            if qid in self.completed_ids:
+            if self.is_already_done(qid):
                 continue
 
             if not task_type:
@@ -806,7 +816,22 @@ class QuestAutocompleter:
                         status = f"{C.YELLOW}▶{C.RESET}"
                     else:
                         status = f"{C.DIM}○{C.RESET}"
-                    log(f"  {status} {name} [{task_label}]", "info")
+
+                    # Expiry warning
+                    expiry_tag = ""
+                    expires = get_expires_at(q)
+                    if expires and not is_completed(q):
+                        try:
+                            exp_dt    = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+                            hours_left = (exp_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+                            if hours_left < 1:
+                                expiry_tag = f" {C.RED}⚠ expires in {hours_left*60:.0f}m!{C.RESET}"
+                            elif hours_left < 6:
+                                expiry_tag = f" {C.YELLOW}⚠ expires in {hours_left:.1f}h{C.RESET}"
+                        except Exception:
+                            pass
+
+                    log(f"  {status} {name} [{task_label}]{expiry_tag}", "info")
 
                 quests    = self.auto_accept(quests)
                 actionable = [
@@ -814,11 +839,23 @@ class QuestAutocompleter:
                     if is_enrolled(q)
                     and not is_completed(q)
                     and is_completable(q)
-                    and q.get("id") not in self.completed_ids
+                    and not self.is_already_done(q.get("id"))
                 ]
                 if actionable:
                     log(f"\n{len(actionable)} quest(s) ready — running in parallel groups", "info")
+                    t_start = time.time()
                     self.run_all_quests(actionable)
+                    elapsed = time.time() - t_start
+                    # ── Completion summary ────────────────────────────────────
+                    done_this_run = [q for q in actionable if self.is_already_done(q.get("id"))]
+                    log("─" * 50, "info")
+                    log(f"Session summary  ({elapsed/60:.1f}m elapsed)", "info")
+                    for q in actionable:
+                        qid  = q.get("id")
+                        name = get_quest_name(q)
+                        mark = f"{C.GREEN}✅ done{C.RESET}" if self.is_already_done(qid) else f"{C.YELLOW}⏳ in progress{C.RESET}"
+                        log(f"  {mark}  {name}", "info")
+                    log("─" * 50, "info")
                 else:
                     log("No quests need completion at this time", "info")
 
