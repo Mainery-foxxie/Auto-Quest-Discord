@@ -65,12 +65,6 @@ class A:   # ANSI shortcuts
     NORM  = "\033[?1049l"   if _TTY else ""   # leave alternate screen
 
 # ── ASCII banner (matches the screenshot's outline/wireframe style) ─────────
-BANNER_LINES = [
-    r"  _   _______ _     ___   ____ ___ _______   __   _  _  ",
-    r" | | / / ____| |   / _ \ / ___|_ _|_   _\ \ / /  \ \/ / ",
-    r" | |/ /|  _| | |  | | | | |    | |  | |  \ V /    >  <  ",
-    r" |___/ |_____|_____\___/ \____|___| |_|    \_/    /_/\_\ ",
-]
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  QuestState  – shared across threads
@@ -113,8 +107,11 @@ class QuestState:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Dashboard – pure ANSI, zero external dependencies
 # ─────────────────────────────────────────────────────────────────────────────
-LOG_LINES   = 8    # visible log rows at the bottom
+LOG_LINES   = 5    # visible log rows (reduced from 8)
 RENDER_HZ   = 0.5  # seconds between redraws
+
+# Compact single-line banner — always fits any terminal width
+BANNER_TEXT = "VELOCITY X"
 
 @dataclass
 class _LogEntry:
@@ -231,172 +228,137 @@ class Dashboard:
             sok    = self._status_ok
             nscan  = self._next_scan
             cycle  = self._cycle
-        spin   = self._spin_frame
+        spin = self._spin_frame
 
         tw = self._tw()
+        th = self._th()
         out: List[str] = []
         W = lambda t="", f=" ": self._line(t, f)
-        H = lambda **kw: self._hline(**kw)
 
         SPIN_CHARS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-        # ── Banner ────────────────────────────────────────────────────────
-        out.append(W())
-        for bl in BANNER_LINES:
-            pad = max(0, (tw - len(bl)) // 2)
-            out.append(W(f"{A.GRN}{' '*pad}{bl}{A.RST}"))
-        out.append(W())
-
-        # ── Status bar ────────────────────────────────────────────────────
+        # ── Header bar (1 line) ───────────────────────────────────────────
         scol  = A.GRN if sok else A.YLW
         sicon = "☑" if sok else "☐"
-        eta   = ""
-        if nscan > time.time():
-            secs = int(nscan - time.time())
-            eta  = f"   {A.DIM}next scan in {secs}s  scan #{cycle}{A.RST}"
         elapsed = int(time.time() - self._start_ts)
         h, rem  = divmod(elapsed, 3600)
         m, s    = divmod(rem, 60)
         uptime  = f"{h:02d}:{m:02d}:{s:02d}"
-        out.append(W(
-            f"  {scol}{A.BOLD}{sicon} {smsg}{A.RST}"
-            f"{eta}"
-            f"   {A.DIM}uptime {uptime}{A.RST}"
-        ))
+        eta = ""
+        if nscan > time.time():
+            eta = f"  scan #{cycle}  next in {int(nscan - time.time())}s"
 
-        # ── User info table ───────────────────────────────────────────────
-        out.append(H(color=A.DIM))
-        col1w = max(20, tw // 3)
-        col2w = tw - col1w - 3
-        out.append(W(
-            f"{A.DIM}│{A.RST} {A.DIM}{'User Account':<{col1w-1}}{A.RST}"
-            f"{A.DIM}│{A.RST} {A.DIM}{'User ID':<{col2w}}{A.RST}{A.DIM}│{A.RST}"
-        ))
-        out.append(H(color=A.DIM))
-        uname_d = (uname[:col1w-2] + "…") if len(uname) > col1w-1 else uname
-        uid_d   = (uid[:col2w-1]   + "…") if len(uid)   > col2w    else uid
-        out.append(W(
-            f"{A.DIM}│{A.RST} {A.CYN}{uname_d:<{col1w-1}}{A.RST}"
-            f"{A.DIM}│{A.RST} {A.CYN}{uid_d:<{col2w}}{A.RST}{A.DIM}│{A.RST}"
-        ))
-        out.append(H(color=A.DIM))
+        # Left: brand + status   Right: user + uptime
+        brand   = f"{A.GRN}{A.BOLD} ⚡ {BANNER_TEXT}{A.RST}"
+        status  = f"  {scol}{sicon} {smsg}{A.RST}{A.DIM}{eta}{A.RST}"
+        right   = f"{A.DIM}{uname}  {uid}  up {uptime} {A.RST}"
 
-        # ── Quest table ───────────────────────────────────────────────────
-        out.append(W())
-        out.append(W(f"  {A.WHT}{A.BOLD}■ LIVE PROGRESS{A.RST}"))
-        out.append(W())
+        # measure plain lengths for right-align
+        plain_left  = re.sub(r'\033\[[^m]*m', '', brand + status)
+        plain_right = re.sub(r'\033\[[^m]*m', '', right)
+        gap = max(1, tw - len(plain_left) - len(plain_right))
+        out.append(W(f"{brand}{status}{' ' * gap}{right}"))
 
-        NO_W   = 4
-        STAT_W = 14
-        REW_W  = 20
-        TIME_W = 12
-        NAME_W = max(16, tw - NO_W - REW_W - TIME_W - STAT_W - 7)
+        # ── Thin divider (1 line) ─────────────────────────────────────────
+        out.append(W(f"{A.DIM}{'─' * tw}{A.RST}"))
 
-        top = (f"{A.DIM}┌{'─'*(NO_W+1)}┬{'─'*(NAME_W+1)}┬"
-               f"{'─'*(REW_W+1)}┬{'─'*(TIME_W+1)}┬{'─'*(STAT_W+1)}┐{A.RST}")
-        sep = (f"{A.DIM}├{'─'*(NO_W+1)}┼{'─'*(NAME_W+1)}┼"
-               f"{'─'*(REW_W+1)}┼{'─'*(TIME_W+1)}┼{'─'*(STAT_W+1)}┤{A.RST}")
-        bot = (f"{A.DIM}└{'─'*(NO_W+1)}┴{'─'*(NAME_W+1)}┴"
-               f"{'─'*(REW_W+1)}┴{'─'*(TIME_W+1)}┴{'─'*(STAT_W+1)}┘{A.RST}")
+        # ── Quest table (scales with terminal height) ──────────────────────
+        # Fixed columns
+        NO_W   = 3
+        TIME_W = 9   # "⠹ MM:SS" or "✓ DONE "
+        STAT_W = 11  # "▶ WATCH_VI"
+        REW_W  = min(18, max(10, tw // 5))
+        NAME_W = max(10, tw - NO_W - REW_W - TIME_W - STAT_W - 6)
 
-        def _trow():
-            return W(
-                f"{A.DIM}│{A.RST}"
-                f"{A.BOLD}{A.WHT} {'No':<{NO_W}}{A.RST}{A.DIM}│{A.RST}"
-                f"{A.BOLD}{A.WHT} {'Quest Name':<{NAME_W}}{A.RST}{A.DIM}│{A.RST}"
-                f"{A.BOLD}{A.WHT} {'Reward':<{REW_W}}{A.RST}{A.DIM}│{A.RST}"
-                f"{A.BOLD}{A.WHT} {'Time Left':<{TIME_W}}{A.RST}{A.DIM}│{A.RST}"
-                f"{A.BOLD}{A.WHT} {'Status':<{STAT_W}}{A.RST}{A.DIM}│{A.RST}"
-            )
+        hdr = (
+            f"{A.DIM}│{A.RST}{A.BOLD}{A.WHT}{'#':>{NO_W}}{A.RST}{A.DIM}│{A.RST}"
+            f"{A.WHT} {'Quest':<{NAME_W}}{A.RST}{A.DIM}│{A.RST}"
+            f"{A.WHT} {'Reward':<{REW_W}}{A.RST}{A.DIM}│{A.RST}"
+            f"{A.WHT} {'Time Left':<{TIME_W}}{A.RST}{A.DIM}│{A.RST}"
+            f"{A.WHT} {'Status':<{STAT_W}}{A.RST}{A.DIM}│{A.RST}"
+        )
+        top = f"{A.DIM}┌{'─'*NO_W}┬{'─'*(NAME_W+1)}┬{'─'*(REW_W+1)}┬{'─'*(TIME_W+1)}┬{'─'*(STAT_W+1)}┐{A.RST}"
+        sep = f"{A.DIM}├{'─'*NO_W}┼{'─'*(NAME_W+1)}┼{'─'*(REW_W+1)}┼{'─'*(TIME_W+1)}┼{'─'*(STAT_W+1)}┤{A.RST}"
+        bot = f"{A.DIM}└{'─'*NO_W}┴{'─'*(NAME_W+1)}┴{'─'*(REW_W+1)}┴{'─'*(TIME_W+1)}┴{'─'*(STAT_W+1)}┘{A.RST}"
 
         out.append(W(top))
-        out.append(_trow())
+        out.append(W(hdr))
 
         if not rows:
             out.append(W(sep))
             out.append(W(
-                f"{A.DIM}│{A.RST} {'':<{NO_W}}{A.DIM}│{A.RST}"
-                f" {A.DIM}{'No active quests':<{NAME_W}}{A.RST}{A.DIM}│{A.RST}"
-                f" {'':<{REW_W}}{A.DIM}│{A.RST}"
-                f" {'':<{TIME_W}}{A.DIM}│{A.RST}"
-                f" {'':<{STAT_W}}{A.DIM}│{A.RST}"
+                f"{A.DIM}│{'':>{NO_W}}│{A.RST}"
+                f" {A.DIM}{'Waiting for quests...':<{NAME_W}}{A.RST}{A.DIM}│{A.RST}"
+                f" {'':>{REW_W}}{A.DIM}│ {'':>{TIME_W}}│ {'':>{STAT_W}}│{A.RST}"
             ))
         else:
             for i, st in enumerate(rows, 1):
                 out.append(W(sep))
-                name_d = (st.name[:NAME_W-1]+"…") if len(st.name) > NAME_W else st.name
-                rew_d  = (st.reward[:REW_W-1]+"…") if len(st.reward) > REW_W else st.reward
+                name_d = (st.name[:NAME_W-1] + "…") if len(st.name) > NAME_W else st.name
+                rew_d  = (st.reward[:REW_W-1] + "…") if len(st.reward) > REW_W else st.reward
 
-                # ── Time Left cell ─────────────────────────────────────
                 if st.status == "done":
-                    tl_col = A.GRN
-                    tl_str = "✓ DONE"
+                    tl_col, tl_str = A.GRN, "✓ DONE"
+                    st_col, st_str = A.GRN, "✓ Done"
                 elif st.status == "running":
-                    secs_left = int(st.remaining)
-                    mm, ss    = divmod(secs_left, 60)
-                    spinner   = SPIN_CHARS[spin % len(SPIN_CHARS)]
-                    tl_col    = A.YLW
-                    tl_str    = f"{spinner} {mm:02d}:{ss:02d}"
+                    mm, ss  = divmod(int(st.remaining), 60)
+                    sp      = SPIN_CHARS[spin % len(SPIN_CHARS)]
+                    tl_col, tl_str = A.YLW, f"{sp} {mm:02d}:{ss:02d}"
+                    st_col, st_str = A.YLW, f"▶ {st.task_type[:STAT_W-3]}"
                 elif st.status == "error":
-                    tl_col = A.RED
-                    tl_str = "✗ ERROR"
+                    tl_col, tl_str = A.RED, "✗ ERROR"
+                    st_col, st_str = A.RED, "✗ Error"
                 elif st.status == "skipped":
-                    tl_col = A.DIM
-                    tl_str = "— SKIP"
+                    tl_col, tl_str = A.DIM, "— SKIP"
+                    st_col, st_str = A.DIM, "— Skip"
                 else:
-                    tl_col = A.DIM
-                    tl_str = "⏳ queued"
-                tl_cell = f"{tl_col}{tl_str:<{TIME_W}}{A.RST}"
-
-                # ── Status cell ────────────────────────────────────────
-                if st.status == "done":
-                    st_col = A.GRN;  st_str = "✓ Done"
-                elif st.status == "running":
-                    st_col = A.YLW;  st_str = f"▶ {st.task_type[:STAT_W-3]}"
-                elif st.status == "error":
-                    st_col = A.RED;  st_str = "✗ Error"
-                elif st.status == "skipped":
-                    st_col = A.DIM;  st_str = "— Skipped"
-                else:
-                    st_col = A.DIM;  st_str = "○ Queued"
+                    tl_col, tl_str = A.DIM, "queued"
+                    st_col, st_str = A.DIM, "○ Queued"
 
                 out.append(W(
-                    f"{A.DIM}│{A.RST}"
-                    f" {A.DIM}{i:<{NO_W}}{A.RST}{A.DIM}│{A.RST}"
+                    f"{A.DIM}│{A.RST}{A.DIM}{i:>{NO_W}}{A.RST}{A.DIM}│{A.RST}"
                     f" {A.CYN}{name_d:<{NAME_W}}{A.RST}{A.DIM}│{A.RST}"
                     f" {A.MAG}{rew_d:<{REW_W}}{A.RST}{A.DIM}│{A.RST}"
-                    f" {tl_cell}{A.DIM}│{A.RST}"
+                    f" {tl_col}{tl_str:<{TIME_W}}{A.RST}{A.DIM}│{A.RST}"
                     f" {st_col}{st_str:<{STAT_W}}{A.RST}{A.DIM}│{A.RST}"
                 ))
 
         out.append(W(bot))
 
-        # ── Log panel ─────────────────────────────────────────────────────
-        out.append(W())
-        out.append(W(f"  {A.WHT}{A.BOLD}■ RECENT LOG{A.RST}"))
-        out.append(H(left="┌", right="┐", color=A.DIM))
-        level_fmt = {
-            "ok":       (A.GRN,  "[  OK]"),
-            "warn":     (A.YLW,  "[WARN]"),
-            "error":    (A.RED,  "[ ERR]"),
-            "progress": (A.DIM,  "[PROG]"),
-            "debug":    (A.DIM,  "[ DBG]"),
-            "info":     (A.CYN,  "[INFO]"),
-        }
-        visible_logs = list(logs)[-LOG_LINES:]
-        for entry in visible_logs:
-            col, lbl = level_fmt.get(entry.level, (A.WHT, f"[{entry.level[:4].upper()}]"))
-            msg_trunc = entry.msg[:tw-22]
-            out.append(W(
-                f"{A.DIM}│{A.RST} {A.DIM}{entry.ts}{A.RST} "
-                f"{col}{lbl}{A.RST} {msg_trunc}"
-            ))
-        for _ in range(LOG_LINES - len(visible_logs)):
-            out.append(W(f"{A.DIM}│{A.RST}"))
-        out.append(H(left="└", right="┘", color=A.DIM))
-        out.append(W(f"  {A.DIM}Ctrl+C to stop{A.RST}"))
+        # ── Log panel (fills remaining terminal height) ────────────────────
+        # Calculate how many log rows we can fit
+        fixed_rows  = len(out) + 3  # +3 for log header, footer, hint line
+        avail_logs  = max(2, th - fixed_rows)
+        show_logs   = min(avail_logs, LOG_LINES)
 
-        # ── Flush ─────────────────────────────────────────────────────────
+        out.append(W(f"{A.DIM}{'─' * tw}{A.RST}"))
+
+        level_fmt = {
+            "ok":       (A.GRN,  "OK  "),
+            "warn":     (A.YLW,  "WARN"),
+            "error":    (A.RED,  "ERR "),
+            "progress": (A.DIM,  "PROG"),
+            "debug":    (A.DIM,  "DBG "),
+            "info":     (A.CYN,  "INFO"),
+        }
+        visible_logs = list(logs)[-show_logs:]
+        for entry in visible_logs:
+            col, lbl = level_fmt.get(entry.level, (A.WHT, entry.level[:4].upper()))
+            msg_w    = tw - 16   # ts(8) + space + lbl(4) + spaces
+            msg_trunc = entry.msg[:msg_w]
+            out.append(W(
+                f" {A.DIM}{entry.ts}{A.RST} "
+                f"{col}{lbl}{A.RST} "
+                f"{msg_trunc}"
+            ))
+        # pad empty rows so layout doesn't jump
+        for _ in range(show_logs - len(visible_logs)):
+            out.append(W())
+
+        out.append(W(f"{A.DIM}{'─' * tw}{A.RST}"))
+        out.append(W(f" {A.DIM}Ctrl+C to stop{A.RST}"))
+
+        # ── Single atomic write → no flicker ──────────────────────────────
         sys.stdout.write(A.HOME + "\n".join(out))
         sys.stdout.flush()
 
