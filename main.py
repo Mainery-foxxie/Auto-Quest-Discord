@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Discord Quest Auto-Completer  – improved edition
+Discord Quest Auto-Completer – live dashboard edition
 Reads configuration from config.json
 """
 
@@ -13,6 +13,9 @@ import re
 import base64
 import traceback
 import threading
+import shutil
+import os
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, List
@@ -22,34 +25,80 @@ CONFIG_FILE = "config.json"
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 BUILD_NUMBER_FALLBACK = 504649
-ENROLL_LOCATION       = 11          # Discord's internal location ID for quest enrollment
-MAX_RATE_LIMIT_WAITS  = 5           # Max consecutive 429s before giving up on an operation
-MAX_FETCH_RETRIES     = 3           # Max retries for fetching quests
+ENROLL_LOCATION       = 11
+MAX_RATE_LIMIT_WAITS  = 5
+MAX_FETCH_RETRIES     = 3
+VIDEO_TICK_INTERVAL   = 1.0
+VIDEO_SPEED           = 7.0
+VIDEO_MAX_FUTURE      = 10.0
 
-VIDEO_TICK_INTERVAL   = 1.0         # seconds between video-progress ticks (matches extension)
-VIDEO_SPEED           = 7.0         # video seconds advanced per tick (matches extension)
-VIDEO_MAX_FUTURE      = 10.0        # max seconds ahead of real-time we can report
+# ─────────────────────────────────────────────────────────────────────────────
+#  ANSI palette  (auto-stripped when not a TTY)
+# ─────────────────────────────────────────────────────────────────────────────
+_TTY = sys.stdout.isatty()
 
-# ── Quest state (one per active quest, shared across threads) ──────────────────
+def _a(code: str) -> str:
+    return f"\033[{code}m" if _TTY else ""
+
+class A:   # ANSI shortcuts
+    RST   = _a("0")
+    BOLD  = _a("1")
+    DIM   = _a("2")
+    # Foreground
+    BLK   = _a("30")
+    RED   = _a("91")
+    GRN   = _a("92")
+    YLW   = _a("93")
+    BLU   = _a("94")
+    MAG   = _a("95")
+    CYN   = _a("96")
+    WHT   = _a("97")
+    # Background
+    BBLK  = _a("40")
+    # Cursor / screen
+    HOME  = "\033[H"        if _TTY else ""
+    CLR   = "\033[2J"       if _TTY else ""
+    ELINE = "\033[K"        if _TTY else ""
+    HIDE  = "\033[?25l"     if _TTY else ""
+    SHOW  = "\033[?25h"     if _TTY else ""
+    ALT   = "\033[?1049h"   if _TTY else ""   # enter alternate screen
+    NORM  = "\033[?1049l"   if _TTY else ""   # leave alternate screen
+
+# ── ASCII banner (matches the screenshot's outline/wireframe style) ─────────
+BANNER_LINES = [
+    r"   _   _   _ _____  ___    ___  _   _ _____ _____  _____  ___  __  __ ____  _     ___ _____ _____ ____  ",
+    r"  / \ | | | |_   _|/ _ \  / _ \| | | | ____/ ___||_   _|/ _ \|  \/  |  _ \| |   | __| ____|_   _| ___| ",
+    r" / _ \| | | | | | | | | || | | | | | |  _| \___ \  | | | | | | |\/| | |_) | |   | _||  _|   | | | _|   ",
+    r"/ ___ \ |_| | | | | |_| || |_| | |_| | |___ ___) | | | | |_| | |  | |  __/| |___| |_| |___  | | | |___ ",
+    r"/_/   \_\___/  |_|  \___/  \__\_\\___/|_____|____/  |_|  \___/|_|  |_|_|   |_____|___|_____| |_| |_____|",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  QuestState  – shared across threads
+# ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class QuestState:
-    """Mutable progress snapshot for a single in-flight quest."""
     quest:          dict
     task_type:      str
     seconds_needed: int
     seconds_done:   float
-    enrolled_ts:    float           # UNIX timestamp when quest was enrolled
+    enrolled_ts:    float
     name:           str
+    reward:         str   = "—"
     completed:      bool  = False
+    status:         str   = "queued"   # queued | running | done | error | skipped
     last_update:    float = field(default_factory=time.time)
-    lock:           threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    lock:           threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
 
     def advance(self, value: float):
-        """Thread-safe progress update."""
         with self.lock:
             self.seconds_done = value
+            self.status = "running"
             if self.seconds_done >= self.seconds_needed:
                 self.completed = True
+                self.status    = "done"
 
     @property
     def remaining(self) -> float:
@@ -61,6 +110,305 @@ class QuestState:
             return 100.0
         return min(100.0, self.seconds_done / self.seconds_needed * 100)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Dashboard – pure ANSI, zero external dependencies
+# ─────────────────────────────────────────────────────────────────────────────
+LOG_LINES   = 8    # visible log rows at the bottom
+RENDER_HZ   = 0.5  # seconds between redraws
+
+@dataclass
+class _LogEntry:
+    ts:    str
+    level: str
+    msg:   str
+
+class Dashboard:
+    """
+    Live terminal dashboard.
+    Call .start() to begin rendering, .stop() to clean up.
+    All public methods are thread-safe.
+    """
+
+    def __init__(self):
+        self._lock        = threading.Lock()
+        self._rows: List[QuestState] = []
+        self._logs        = deque(maxlen=200)
+        self._username    = "—"
+        self._user_id     = "—"
+        self._status_msg  = "INITIALIZING..."
+        self._status_ok   = False
+        self._next_scan   = 0.0
+        self._cycle       = 0
+        self._running     = False
+        self._thread: Optional[threading.Thread] = None
+        self._start_ts    = time.time()
+        self._spin_frame  = 0   # animation tick for running quests
+
+    # ── Public API ─────────────────────────────────────────────────────────
+    def set_user(self, username: str, user_id: str):
+        with self._lock:
+            self._username = username
+            self._user_id  = user_id
+
+    def set_status(self, msg: str, ok: bool = True):
+        with self._lock:
+            self._status_msg = msg
+            self._status_ok  = ok
+
+    def set_next_scan(self, ts: float):
+        with self._lock:
+            self._next_scan = ts
+
+    def set_cycle(self, n: int):
+        with self._lock:
+            self._cycle = n
+
+    def set_rows(self, states: List[QuestState]):
+        with self._lock:
+            self._rows = list(states)
+
+    def add_log(self, ts: str, level: str, msg: str):
+        with self._lock:
+            self._logs.append(_LogEntry(ts, level, msg))
+
+    # ── Render thread ──────────────────────────────────────────────────────
+    def start(self):
+        if not _TTY:
+            return
+        self._running = True
+        sys.stdout.write(A.ALT + A.HIDE)
+        sys.stdout.flush()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="Dashboard")
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2)
+        if _TTY:
+            sys.stdout.write(A.NORM + A.SHOW)
+            sys.stdout.flush()
+
+    def _loop(self):
+        while self._running:
+            try:
+                self._spin_frame += 1
+                self._render()
+            except Exception:
+                pass
+            time.sleep(RENDER_HZ)
+
+    # ── Drawing helpers ────────────────────────────────────────────────────
+    @staticmethod
+    def _tw() -> int:
+        return shutil.get_terminal_size((100, 30)).columns
+
+    @staticmethod
+    def _th() -> int:
+        return shutil.get_terminal_size((100, 30)).lines
+
+    def _line(self, txt: str = "", fill: str = " ") -> str:
+        """Pad/truncate txt to terminal width then clear to EOL."""
+        tw = self._tw()
+        # strip ANSI for length calc
+        plain = re.sub(r'\033\[[^m]*m', '', txt)
+        pad   = max(0, tw - len(plain))
+        return txt + fill * pad + A.ELINE
+
+    def _hline(self, char: str = "─", left: str = "├", right: str = "┤",
+               color: str = "") -> str:
+        tw  = self._tw()
+        mid = char * (tw - 2)
+        return self._line(f"{color}{left}{mid}{right}{A.RST}")
+
+    def _render(self):
+        with self._lock:
+            rows   = list(self._rows)
+            logs   = list(self._logs)
+            uname  = self._username
+            uid    = self._user_id
+            smsg   = self._status_msg
+            sok    = self._status_ok
+            nscan  = self._next_scan
+            cycle  = self._cycle
+        spin   = self._spin_frame
+
+        tw = self._tw()
+        out: List[str] = []
+        W = lambda t="", f=" ": self._line(t, f)
+        H = lambda **kw: self._hline(**kw)
+
+        SPIN_CHARS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+        # ── Banner ────────────────────────────────────────────────────────
+        out.append(W())
+        for bl in BANNER_LINES:
+            pad = max(0, (tw - len(bl)) // 2)
+            out.append(W(f"{A.GRN}{' '*pad}{bl}{A.RST}"))
+        out.append(W())
+
+        # ── Status bar ────────────────────────────────────────────────────
+        scol  = A.GRN if sok else A.YLW
+        sicon = "☑" if sok else "☐"
+        eta   = ""
+        if nscan > time.time():
+            secs = int(nscan - time.time())
+            eta  = f"   {A.DIM}next scan in {secs}s  scan #{cycle}{A.RST}"
+        elapsed = int(time.time() - self._start_ts)
+        h, rem  = divmod(elapsed, 3600)
+        m, s    = divmod(rem, 60)
+        uptime  = f"{h:02d}:{m:02d}:{s:02d}"
+        out.append(W(
+            f"  {scol}{A.BOLD}{sicon} {smsg}{A.RST}"
+            f"{eta}"
+            f"   {A.DIM}uptime {uptime}{A.RST}"
+        ))
+
+        # ── User info table ───────────────────────────────────────────────
+        out.append(H(color=A.DIM))
+        col1w = max(20, tw // 3)
+        col2w = tw - col1w - 3
+        out.append(W(
+            f"{A.DIM}│{A.RST} {A.DIM}{'User Account':<{col1w-1}}{A.RST}"
+            f"{A.DIM}│{A.RST} {A.DIM}{'User ID':<{col2w}}{A.RST}{A.DIM}│{A.RST}"
+        ))
+        out.append(H(color=A.DIM))
+        uname_d = (uname[:col1w-2] + "…") if len(uname) > col1w-1 else uname
+        uid_d   = (uid[:col2w-1]   + "…") if len(uid)   > col2w    else uid
+        out.append(W(
+            f"{A.DIM}│{A.RST} {A.CYN}{uname_d:<{col1w-1}}{A.RST}"
+            f"{A.DIM}│{A.RST} {A.CYN}{uid_d:<{col2w}}{A.RST}{A.DIM}│{A.RST}"
+        ))
+        out.append(H(color=A.DIM))
+
+        # ── Quest table ───────────────────────────────────────────────────
+        out.append(W())
+        out.append(W(f"  {A.WHT}{A.BOLD}■ LIVE PROGRESS{A.RST}"))
+        out.append(W())
+
+        NO_W   = 4
+        STAT_W = 14
+        REW_W  = 20
+        TIME_W = 12
+        NAME_W = max(16, tw - NO_W - REW_W - TIME_W - STAT_W - 7)
+
+        top = (f"{A.DIM}┌{'─'*(NO_W+1)}┬{'─'*(NAME_W+1)}┬"
+               f"{'─'*(REW_W+1)}┬{'─'*(TIME_W+1)}┬{'─'*(STAT_W+1)}┐{A.RST}")
+        sep = (f"{A.DIM}├{'─'*(NO_W+1)}┼{'─'*(NAME_W+1)}┼"
+               f"{'─'*(REW_W+1)}┼{'─'*(TIME_W+1)}┼{'─'*(STAT_W+1)}┤{A.RST}")
+        bot = (f"{A.DIM}└{'─'*(NO_W+1)}┴{'─'*(NAME_W+1)}┴"
+               f"{'─'*(REW_W+1)}┴{'─'*(TIME_W+1)}┴{'─'*(STAT_W+1)}┘{A.RST}")
+
+        def _trow():
+            return W(
+                f"{A.DIM}│{A.RST}"
+                f"{A.BOLD}{A.WHT} {'No':<{NO_W}}{A.RST}{A.DIM}│{A.RST}"
+                f"{A.BOLD}{A.WHT} {'Quest Name':<{NAME_W}}{A.RST}{A.DIM}│{A.RST}"
+                f"{A.BOLD}{A.WHT} {'Reward':<{REW_W}}{A.RST}{A.DIM}│{A.RST}"
+                f"{A.BOLD}{A.WHT} {'Time Left':<{TIME_W}}{A.RST}{A.DIM}│{A.RST}"
+                f"{A.BOLD}{A.WHT} {'Status':<{STAT_W}}{A.RST}{A.DIM}│{A.RST}"
+            )
+
+        out.append(W(top))
+        out.append(_trow())
+
+        if not rows:
+            out.append(W(sep))
+            out.append(W(
+                f"{A.DIM}│{A.RST} {'':<{NO_W}}{A.DIM}│{A.RST}"
+                f" {A.DIM}{'No active quests':<{NAME_W}}{A.RST}{A.DIM}│{A.RST}"
+                f" {'':<{REW_W}}{A.DIM}│{A.RST}"
+                f" {'':<{TIME_W}}{A.DIM}│{A.RST}"
+                f" {'':<{STAT_W}}{A.DIM}│{A.RST}"
+            ))
+        else:
+            for i, st in enumerate(rows, 1):
+                out.append(W(sep))
+                name_d = (st.name[:NAME_W-1]+"…") if len(st.name) > NAME_W else st.name
+                rew_d  = (st.reward[:REW_W-1]+"…") if len(st.reward) > REW_W else st.reward
+
+                # ── Time Left cell ─────────────────────────────────────
+                if st.status == "done":
+                    tl_col = A.GRN
+                    tl_str = "✓ DONE"
+                elif st.status == "running":
+                    secs_left = int(st.remaining)
+                    mm, ss    = divmod(secs_left, 60)
+                    spinner   = SPIN_CHARS[spin % len(SPIN_CHARS)]
+                    tl_col    = A.YLW
+                    tl_str    = f"{spinner} {mm:02d}:{ss:02d}"
+                elif st.status == "error":
+                    tl_col = A.RED
+                    tl_str = "✗ ERROR"
+                elif st.status == "skipped":
+                    tl_col = A.DIM
+                    tl_str = "— SKIP"
+                else:
+                    tl_col = A.DIM
+                    tl_str = "⏳ queued"
+                tl_cell = f"{tl_col}{tl_str:<{TIME_W}}{A.RST}"
+
+                # ── Status cell ────────────────────────────────────────
+                if st.status == "done":
+                    st_col = A.GRN;  st_str = "✓ Done"
+                elif st.status == "running":
+                    st_col = A.YLW;  st_str = f"▶ {st.task_type[:STAT_W-3]}"
+                elif st.status == "error":
+                    st_col = A.RED;  st_str = "✗ Error"
+                elif st.status == "skipped":
+                    st_col = A.DIM;  st_str = "— Skipped"
+                else:
+                    st_col = A.DIM;  st_str = "○ Queued"
+
+                out.append(W(
+                    f"{A.DIM}│{A.RST}"
+                    f" {A.DIM}{i:<{NO_W}}{A.RST}{A.DIM}│{A.RST}"
+                    f" {A.CYN}{name_d:<{NAME_W}}{A.RST}{A.DIM}│{A.RST}"
+                    f" {A.MAG}{rew_d:<{REW_W}}{A.RST}{A.DIM}│{A.RST}"
+                    f" {tl_cell}{A.DIM}│{A.RST}"
+                    f" {st_col}{st_str:<{STAT_W}}{A.RST}{A.DIM}│{A.RST}"
+                ))
+
+        out.append(W(bot))
+
+        # ── Log panel ─────────────────────────────────────────────────────
+        out.append(W())
+        out.append(W(f"  {A.WHT}{A.BOLD}■ RECENT LOG{A.RST}"))
+        out.append(H(left="┌", right="┐", color=A.DIM))
+        level_fmt = {
+            "ok":       (A.GRN,  "[  OK]"),
+            "warn":     (A.YLW,  "[WARN]"),
+            "error":    (A.RED,  "[ ERR]"),
+            "progress": (A.DIM,  "[PROG]"),
+            "debug":    (A.DIM,  "[ DBG]"),
+            "info":     (A.CYN,  "[INFO]"),
+        }
+        visible_logs = list(logs)[-LOG_LINES:]
+        for entry in visible_logs:
+            col, lbl = level_fmt.get(entry.level, (A.WHT, f"[{entry.level[:4].upper()}]"))
+            msg_trunc = entry.msg[:tw-22]
+            out.append(W(
+                f"{A.DIM}│{A.RST} {A.DIM}{entry.ts}{A.RST} "
+                f"{col}{lbl}{A.RST} {msg_trunc}"
+            ))
+        for _ in range(LOG_LINES - len(visible_logs)):
+            out.append(W(f"{A.DIM}│{A.RST}"))
+        out.append(H(left="└", right="┘", color=A.DIM))
+        out.append(W(f"  {A.DIM}Ctrl+C to stop{A.RST}"))
+
+        # ── Flush ─────────────────────────────────────────────────────────
+        sys.stdout.write(A.HOME + "\n".join(out))
+        sys.stdout.flush()
+
+
+# ── Global dashboard instance (created in main()) ──────────────────────────────
+_dash: Optional[Dashboard] = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Config
+# ─────────────────────────────────────────────────────────────────────────────
 def load_config():
     try:
         with open(CONFIG_FILE, 'r') as f:
@@ -83,109 +431,72 @@ POLL_INTERVAL      = config.get("POLL_INTERVAL", 60)
 HEARTBEAT_INTERVAL = config.get("HEARTBEAT_INTERVAL", 20)
 AUTO_ACCEPT        = config.get("AUTO_ACCEPT", True)
 LOG_PROGRESS       = config.get("LOG_PROGRESS", True)
-DEBUG              = config.get("DEBUG", False)   # default OFF for stealth
+DEBUG              = config.get("DEBUG", False)
 
-# Known task types supported for completion
 SUPPORTED_TASKS = [
-    "WATCH_VIDEO",
-    "PLAY_ON_DESKTOP",
-    "STREAM_ON_DESKTOP",
-    "PLAY_ACTIVITY",
-    "WATCH_VIDEO_ON_MOBILE",
-    # Additional types discovered via [?] quests – treated as heartbeat
-    "PLAY_ON_MOBILE",
-    "WATCH_VIDEO_ON_DESKTOP",
-    "ACHIEVEMENT_IN_ACTIVITY",
+    "WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP",
+    "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE", "PLAY_ON_MOBILE",
+    "WATCH_VIDEO_ON_DESKTOP", "ACHIEVEMENT_IN_ACTIVITY",
 ]
+HEARTBEAT_TASKS = {"PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "PLAY_ON_MOBILE"}
+ACHIEVEMENT_TASKS = {"ACHIEVEMENT_IN_ACTIVITY"}
+VIDEO_TASKS = {"WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE", "WATCH_VIDEO_ON_DESKTOP"}
 
-# Task types that use heartbeat (play/stream) vs video-progress
-HEARTBEAT_TASKS = {
-    "PLAY_ON_DESKTOP",
-    "STREAM_ON_DESKTOP",
-    "PLAY_ACTIVITY",       # same heartbeat endpoint as PLAY_ON_DESKTOP
-    "PLAY_ON_MOBILE",
-}
 
-ACHIEVEMENT_TASKS = {
-    "ACHIEVEMENT_IN_ACTIVITY",
-}
-VIDEO_TASKS = {
-    "WATCH_VIDEO",
-    "WATCH_VIDEO_ON_MOBILE",
-    "WATCH_VIDEO_ON_DESKTOP",
-}
-
-# ── Logging ────────────────────────────────────────────────────────────────────
-class C:
-    """ANSI color codes — automatically stripped when stdout is not a TTY."""
-    _tty = sys.stdout.isatty()
-
-    RESET  = "\033[0m"  if _tty else ""
-    GREEN  = "\033[92m" if _tty else ""
-    YELLOW = "\033[93m" if _tty else ""
-    RED    = "\033[91m" if _tty else ""
-    CYAN   = "\033[96m" if _tty else ""
-    BOLD   = "\033[1m"  if _tty else ""
-    DIM    = "\033[2m"  if _tty else ""
-
+# ─────────────────────────────────────────────────────────────────────────────
+#  Logging  –  routes through dashboard when live, else plain print
+# ─────────────────────────────────────────────────────────────────────────────
 def log(msg: str, level: str = "info"):
-    ts = datetime.now().strftime("%H:%M:%S")
-    prefix = {
-        "info":     f"{C.CYAN}[INFO]{C.RESET}",
-        "ok":       f"{C.GREEN}[  OK]{C.RESET}",
-        "warn":     f"{C.YELLOW}[WARN]{C.RESET}",
-        "error":    f"{C.RED}[ ERR]{C.RESET}",
-        "progress": f"{C.DIM}[PROG]{C.RESET}",
-        "debug":    f"{C.DIM}[DBG ]{C.RESET}",
-    }.get(level, f"[{level.upper()}]")
     if level == "debug" and not DEBUG:
         return
-    if LOG_PROGRESS or level != "progress":
-        print(f"{C.DIM}{ts}{C.RESET} {prefix} {msg}")
+    if level == "progress" and not LOG_PROGRESS:
+        return
+    # strip ANSI for clean log storage
+    clean = re.sub(r'\033\[[^m]*m', '', msg)
+    ts = datetime.now().strftime("%H:%M:%S")
+    if _dash:
+        _dash.add_log(ts, level, clean)
+    else:
+        # fallback: plain print
+        pfx = {
+            "info": f"{A.CYN}[INFO]{A.RST}", "ok": f"{A.GRN}[  OK]{A.RST}",
+            "warn": f"{A.YLW}[WARN]{A.RST}", "error": f"{A.RED}[ ERR]{A.RST}",
+            "progress": f"{A.DIM}[PROG]{A.RST}", "debug": f"{A.DIM}[ DBG]{A.RST}",
+        }.get(level, f"[{level.upper()}]")
+        print(f"{A.DIM}{ts}{A.RST} {pfx} {msg}")
 
-# ── Anti-detection helpers ─────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 def jitter(base: float, pct: float = 0.20) -> float:
-    """Return base ± pct% random variation."""
-    spread = base * pct
-    return base + random.uniform(-spread, spread)
+    return base + random.uniform(-base*pct, base*pct)
 
 def human_sleep(base: float, pct: float = 0.25):
-    """Sleep for base seconds with random jitter."""
-    t = max(0.5, jitter(base, pct))
-    time.sleep(t)
+    time.sleep(max(0.5, jitter(base, pct)))
 
 def random_sleep(lo: float, hi: float):
-    """Sleep for a uniformly random duration between lo and hi seconds.
-
-    Use this instead of ``human_sleep(random.uniform(lo, hi))`` — the latter
-    double-applies randomness (uniform pick *then* ±25% jitter).
-    """
     time.sleep(random.uniform(lo, hi))
 
 def _wait_for_rate_limit(response: requests.Response, context: str = "") -> float:
-    """Extract retry_after from a 429 response, log it, and sleep.
-
-    Returns the number of seconds waited.
-    """
     try:
         retry_after = response.json().get("retry_after", 10)
     except Exception:
         retry_after = 10
     wait = retry_after + random.uniform(0.5, 2)
-    label = f" ({context})" if context else ""
-    log(f"  Rate limited{label} – waiting {wait:.1f}s", "warn")
+    log(f"Rate limited{f' ({context})' if context else ''} – waiting {wait:.1f}s", "warn")
     time.sleep(wait)
     return wait
 
-# ── Build number ───────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Build number
+# ─────────────────────────────────────────────────────────────────────────────
 def fetch_latest_build_number() -> int:
     try:
         log("Fetching Discord build number...", "info")
-        ua = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/128.0.0.0 Safari/537.36"
-        )
+        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
         r = requests.get("https://discord.com/app", headers={"User-Agent": ua}, timeout=15)
         if r.status_code != 200:
             log(f"Discord page returned {r.status_code}, using fallback", "warn")
@@ -196,14 +507,12 @@ def fetch_latest_build_number() -> int:
             scripts = [s.split('/')[-1].replace('.js', '') for s in alts]
         for asset_hash in scripts[-5:]:
             try:
-                ar = requests.get(
-                    f"https://discord.com/assets/{asset_hash}.js",
-                    headers={"User-Agent": ua}, timeout=15
-                )
+                ar = requests.get(f"https://discord.com/assets/{asset_hash}.js",
+                                  headers={"User-Agent": ua}, timeout=15)
                 m = re.search(r'buildNumber["\s:]+["\s]*(\d{5,7})', ar.text)
                 if m:
                     bn = int(m.group(1))
-                    log(f"Build number: {C.BOLD}{bn}{C.RESET}", "ok")
+                    log(f"Build number: {bn}", "ok")
                     return bn
             except Exception:
                 continue
@@ -213,22 +522,20 @@ def fetch_latest_build_number() -> int:
         log(f"Error fetching build number: {e}, using fallback", "warn")
         return BUILD_NUMBER_FALLBACK
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Super-properties
+# ─────────────────────────────────────────────────────────────────────────────
 def make_super_properties(build_number: int) -> str:
     obj = {
-        "os": "Windows",
-        "browser": "Discord Client",
-        "release_channel": "stable",
-        "client_version": "1.0.9175",
-        "os_version": "10.0.26100",
-        "os_arch": "x64",
-        "app_arch": "x64",
+        "os": "Windows", "browser": "Discord Client",
+        "release_channel": "stable", "client_version": "1.0.9175",
+        "os_version": "10.0.26100", "os_arch": "x64", "app_arch": "x64",
         "system_locale": "en-US",
         "browser_user_agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "discord/1.0.9175 Chrome/128.0.6613.186 "
-            "Electron/32.2.7 Safari/537.36"
-        ),
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) discord/1.0.9175 Chrome/128.0.6613.186 "
+            "Electron/32.2.7 Safari/537.36"),
         "browser_version": "32.2.7",
         "client_build_number": build_number,
         "native_build_number": 59498,
@@ -236,53 +543,44 @@ def make_super_properties(build_number: int) -> str:
     }
     return base64.b64encode(json.dumps(obj, separators=(',', ':')).encode()).decode()
 
-# ── Discord API ────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Discord API
+# ─────────────────────────────────────────────────────────────────────────────
 class DiscordAPI:
     def __init__(self, token: str, build_number: int):
-        self.token = token
+        self.token   = token
         self.session = requests.Session()
-        self._lock = threading.Lock()   # serialize requests — session is not thread-safe
-        ua = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "discord/1.0.9175 Chrome/128.0.6613.186 "
-            "Electron/32.2.7 Safari/537.36"
-        )
-        sp = make_super_properties(build_number)
+        self._lock   = threading.Lock()
+        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) discord/1.0.9175 Chrome/128.0.6613.186 "
+              "Electron/32.2.7 Safari/537.36")
         self.session.headers.update({
-            "Authorization": token,
-            "Content-Type": "application/json",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "User-Agent": ua,
-            "X-Super-Properties": sp,
-            "X-Discord-Locale": "en-US",
-            "X-Discord-Timezone": "America/New_York",
+            "Authorization": token, "Content-Type": "application/json",
+            "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br", "User-Agent": ua,
+            "X-Super-Properties": make_super_properties(build_number),
+            "X-Discord-Locale": "en-US", "X-Discord-Timezone": "America/New_York",
             "X-Debug-Options": "bugReporterEnabled",
             "Origin": "https://discord.com",
             "Referer": "https://discord.com/channels/@me",
-            "DNT": "1",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
+            "DNT": "1", "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin",
         })
 
-    def get(self, path: str, **kwargs) -> requests.Response:
-        url = f"https://discord.com/api/v9{path}"
+    def get(self, path: str, **kw) -> requests.Response:
         log(f"GET {path}", "debug")
         with self._lock:
             time.sleep(random.uniform(0.1, 0.4))
-            r = self.session.get(url, **kwargs)
+            r = self.session.get(f"https://discord.com/api/v9{path}", **kw)
         log(f"  -> {r.status_code}", "debug")
         return r
 
-    def post(self, path: str, payload: Optional[dict] = None, **kwargs) -> requests.Response:
-        url = f"https://discord.com/api/v9{path}"
+    def post(self, path: str, payload: Optional[dict] = None, **kw) -> requests.Response:
         log(f"POST {path}", "debug")
         with self._lock:
             time.sleep(random.uniform(0.1, 0.4))
-            r = self.session.post(url, json=payload, **kwargs)
+            r = self.session.post(f"https://discord.com/api/v9{path}", json=payload, **kw)
         log(f"  -> {r.status_code}", "debug")
         return r
 
@@ -291,22 +589,29 @@ class DiscordAPI:
             r = self.get("/users/@me")
             if r.status_code == 200:
                 user = r.json()
-                name = user.get("username", "?")
-                log(f"Logged in as: {C.BOLD}{name}{C.RESET} (ID: {user['id']})", "ok")
+                uname = user.get("username", "?")
+                uid   = str(user.get("id", "?"))
+                log(f"Logged in as: {uname} (ID: {uid})", "ok")
+                if _dash:
+                    _dash.set_user(uname, uid)
+                    _dash.set_status("SYSTEM RUNNING...", ok=True)
                 return True
             log(f"Invalid token (status {r.status_code})", "error")
+            if _dash:
+                _dash.set_status("AUTH FAILED", ok=False)
             return False
         except Exception as e:
             log(f"Cannot connect to Discord: {e}", "error")
             return False
 
-# ── Quest helpers ──────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Quest helpers
+# ─────────────────────────────────────────────────────────────────────────────
 def _get(d: Optional[dict], *keys):
-    if d is None:
-        return None
+    if d is None: return None
     for k in keys:
-        if k in d:
-            return d[k]
+        if k in d: return d[k]
     return None
 
 def get_task_config(quest: dict) -> Optional[dict]:
@@ -314,18 +619,32 @@ def get_task_config(quest: dict) -> Optional[dict]:
     return _get(cfg, "taskConfig", "task_config", "taskConfigV2", "task_config_v2")
 
 def get_quest_name(quest: dict) -> str:
-    cfg = quest.get("config", {})
+    cfg  = quest.get("config", {})
     msgs = cfg.get("messages", {})
-    name = _get(msgs, "questName", "quest_name")
-    if name:
-        return name.strip()
-    game = _get(msgs, "gameTitle", "game_title")
-    if game:
-        return game.strip()
+    for key in ("questName", "quest_name", "gameTitle", "game_title"):
+        v = msgs.get(key)
+        if v: return v.strip()
     app_name = cfg.get("application", {}).get("name")
-    if app_name:
-        return app_name
+    if app_name: return app_name
     return f"Quest#{quest.get('id', '?')}"
+
+def get_quest_reward(quest: dict) -> str:
+    """Best-effort extraction of the reward label from a quest config."""
+    cfg = quest.get("config", {})
+    # try structured reward fields
+    for key in ("rewardItems", "reward_items", "rewards"):
+        items = cfg.get(key)
+        if items and isinstance(items, list) and items:
+            item = items[0]
+            if isinstance(item, dict):
+                name = item.get("name") or item.get("label") or item.get("item_name")
+                if name: return name
+    # try messages
+    msgs = cfg.get("messages", {})
+    for key in ("rewardDescription", "reward_description", "rewardTitle", "reward_title"):
+        v = msgs.get(key)
+        if v: return v.strip()
+    return "—"
 
 def get_expires_at(quest: dict) -> Optional[str]:
     cfg = quest.get("config", {})
@@ -339,550 +658,378 @@ def is_completable(quest: dict) -> bool:
     expires = get_expires_at(quest)
     if expires:
         try:
-            exp_dt = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-            if exp_dt <= datetime.now(timezone.utc):
+            if datetime.fromisoformat(expires.replace("Z", "+00:00")) <= datetime.now(timezone.utc):
                 return False
-        except Exception:
-            pass
+        except Exception: pass
     tc = get_task_config(quest)
-    if not tc or "tasks" not in tc:
-        return False
-    tasks = tc["tasks"]
-    return any(tasks.get(t) is not None for t in SUPPORTED_TASKS)
+    if not tc or "tasks" not in tc: return False
+    return any(tc["tasks"].get(t) is not None for t in SUPPORTED_TASKS)
 
 def is_enrolled(quest: dict) -> bool:
-    us = get_user_status(quest)
-    return bool(_get(us, "enrolledAt", "enrolled_at"))
+    return bool(_get(get_user_status(quest), "enrolledAt", "enrolled_at"))
 
 def is_completed(quest: dict) -> bool:
-    us = get_user_status(quest)
-    return bool(_get(us, "completedAt", "completed_at"))
+    return bool(_get(get_user_status(quest), "completedAt", "completed_at"))
 
 def get_task_type(quest: dict) -> Optional[str]:
     tc = get_task_config(quest)
-    if not tc or "tasks" not in tc:
-        return None
+    if not tc or "tasks" not in tc: return None
     for t in SUPPORTED_TASKS:
-        if tc["tasks"].get(t) is not None:
-            return t
+        if tc["tasks"].get(t) is not None: return t
     return None
 
 def get_raw_task_keys(quest: dict) -> list:
-    """Return all task keys present in the quest config (for debugging [?] quests)."""
     tc = get_task_config(quest)
-    if not tc or "tasks" not in tc:
-        return []
+    if not tc or "tasks" not in tc: return []
     return list(tc["tasks"].keys())
 
 def get_activity_quest_info(quest: dict) -> dict:
-    """
-    Extract info for ACHIEVEMENT_IN_ACTIVITY quests.
-    Returns dict with: app_id, event_name, target (how many times to fire).
-    """
     tc = get_task_config(quest)
-    if not tc:
-        return {}
+    if not tc: return {}
     task_data = tc.get("tasks", {}).get("ACHIEVEMENT_IN_ACTIVITY", {})
-
-    # application_id lives inside an "applications" list
     app_id = None
     apps = task_data.get("applications") or []
-    if apps and isinstance(apps, list):
-        app_id = apps[0].get("id")
-    # fallback: top-level application in config
-    if not app_id:
-        app_id = quest.get("config", {}).get("application", {}).get("id")
-
-    return {
-        "app_id":     app_id,
-        "event_name": task_data.get("event_name", "progress"),
-        "target":     task_data.get("target", 1),
-    }
+    if apps and isinstance(apps, list): app_id = apps[0].get("id")
+    if not app_id: app_id = quest.get("config", {}).get("application", {}).get("id")
+    return {"app_id": app_id,
+            "event_name": task_data.get("event_name", "progress"),
+            "target": task_data.get("target", 1)}
 
 def get_seconds_needed(quest: dict) -> int:
     tc = get_task_config(quest)
-    task_type = get_task_type(quest)
-    if not tc or not task_type:
-        return 0
-    return tc["tasks"][task_type].get("target", 0)
+    tt = get_task_type(quest)
+    if not tc or not tt: return 0
+    return tc["tasks"][tt].get("target", 0)
 
 def get_seconds_done(quest: dict) -> float:
-    task_type = get_task_type(quest)
-    if not task_type:
-        return 0
+    tt = get_task_type(quest)
+    if not tt: return 0
     us = get_user_status(quest)
-    progress = us.get("progress") or {}
-    return progress.get(task_type, {}).get("value", 0)
+    return (us.get("progress") or {}).get(tt, {}).get("value", 0)
 
 def get_enrolled_at(quest: dict) -> Optional[str]:
-    us = get_user_status(quest)
-    return _get(us, "enrolledAt", "enrolled_at")
+    return _get(get_user_status(quest), "enrolledAt", "enrolled_at")
 
-# ── Core logic ─────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Core logic
+# ─────────────────────────────────────────────────────────────────────────────
 class QuestAutocompleter:
     def __init__(self, api: DiscordAPI):
-        self.api = api
+        self.api            = api
         self._completed_ids: set = set()
-        self._ids_lock = threading.Lock()
-
-    # ── Thread-safe completed_ids access ──────────────────────────────────────
-    @property
-    def completed_ids(self) -> set:
-        return self._completed_ids
+        self._ids_lock      = threading.Lock()
 
     def mark_completed(self, qid: str):
-        with self._ids_lock:
-            self._completed_ids.add(qid)
+        with self._ids_lock: self._completed_ids.add(qid)
 
     def is_already_done(self, qid: str) -> bool:
-        with self._ids_lock:
-            return qid in self._completed_ids
+        with self._ids_lock: return qid in self._completed_ids
 
-    # ── Fetch quests ───────────────────────────────────────────────────────────
+    # ── Fetch ──────────────────────────────────────────────────────────────
     def fetch_quests(self) -> list:
-        """Fetch the current quest list, retrying on rate limits (iterative, no recursion)."""
         for attempt in range(1, MAX_FETCH_RETRIES + 1):
             try:
                 r = self.api.get("/quests/@me")
                 if r.status_code == 200:
                     data = r.json()
                     if isinstance(data, dict):
-                        quests   = data.get("quests", [])
-                        excluded = data.get("excluded_quests", [])
-                        blocked  = _get(data, "quest_enrollment_blocked_until")
-                        if blocked:
-                            log(f"Enrollment blocked until: {blocked}", "warn")
-                        if excluded:
-                            log(f"{len(excluded)} quest(s) excluded", "debug")
-                        return quests
-                    elif isinstance(data, list):
-                        return data
-                    return []
+                        blocked = _get(data, "quest_enrollment_blocked_until")
+                        if blocked: log(f"Enrollment blocked until: {blocked}", "warn")
+                        return data.get("quests", [])
+                    return data if isinstance(data, list) else []
                 elif r.status_code == 429:
                     if attempt >= MAX_FETCH_RETRIES:
-                        log("Max fetch retries reached after rate limiting.", "error")
-                        return []
-                    _wait_for_rate_limit(r, context=f"fetch attempt {attempt}/{MAX_FETCH_RETRIES}")
-                    # loop continues
+                        log("Max fetch retries reached.", "error"); return []
+                    _wait_for_rate_limit(r, f"fetch {attempt}/{MAX_FETCH_RETRIES}")
                 else:
-                    log(f"Quest fetch error ({r.status_code}): {r.text[:200]}", "warn")
-                    return []
+                    log(f"Quest fetch error ({r.status_code}): {r.text[:200]}", "warn"); return []
             except Exception as e:
                 log(f"Error fetching quests: {e}", "error")
-                if DEBUG:
-                    traceback.print_exc()
+                if DEBUG: traceback.print_exc()
                 return []
         return []
 
-    # ── Enroll ─────────────────────────────────────────────────────────────────
+    # ── Enroll ────────────────────────────────────────────────────────────
     def enroll_quest(self, quest: dict) -> bool:
-        """Enroll in a quest with up to 3 attempts, retrying on 429 or transient errors."""
         name = get_quest_name(quest)
         qid  = quest["id"]
         for attempt in range(1, 4):
             try:
                 random_sleep(1.5, 4.0)
                 r = self.api.post(f"/quests/{qid}/enroll", {
-                    "location": ENROLL_LOCATION,
-                    "is_targeted": False,
-                    "metadata_raw": None,
-                    "metadata_sealed": None,
+                    "location": ENROLL_LOCATION, "is_targeted": False,
+                    "metadata_raw": None, "metadata_sealed": None,
                     "traffic_metadata_raw":    quest.get("traffic_metadata_raw"),
                     "traffic_metadata_sealed": quest.get("traffic_metadata_sealed"),
                 })
                 if r.status_code == 429:
                     if attempt >= 3:
-                        log(f"Skipping \"{name}\" after 3 rate limits", "warn")
-                        return False
-                    _wait_for_rate_limit(r, context=f"enrolling \"{name}\" attempt {attempt}/3")
-                    continue   # retry
+                        log(f'Skipping "{name}" after 3 rate limits', "warn"); return False
+                    _wait_for_rate_limit(r, f'enrolling "{name}" {attempt}/3'); continue
                 if r.status_code in (200, 201, 204):
-                    log(f"Enrolled: {C.BOLD}{name}{C.RESET}", "ok")
-                    return True
-                log(f"Enroll \"{name}\" failed ({r.status_code}): {r.text[:200]}", "warn")
+                    log(f"Enrolled: {name}", "ok"); return True
+                log(f'Enroll "{name}" failed ({r.status_code}): {r.text[:200]}', "warn")
                 return False
             except Exception as e:
-                log(f"Error enrolling \"{name}\" (attempt {attempt}/3): {e}", "error")
-                if attempt >= 3:
-                    return False
-                # brief back-off before retry on transient network errors
+                log(f'Error enrolling "{name}" ({attempt}/3): {e}', "error")
+                if attempt >= 3: return False
                 time.sleep(random.uniform(1, 3))
         return False
 
     def auto_accept(self, quests: list) -> list:
-        if not AUTO_ACCEPT:
-            return quests
-        unaccepted = [
-            q for q in quests
-            if not is_enrolled(q) and not is_completed(q) and is_completable(q)
-        ]
-        if not unaccepted:
-            return quests
-        log(f"Found {len(unaccepted)} unenrolled quest(s) – auto-accepting...", "info")
+        if not AUTO_ACCEPT: return quests
+        unaccepted = [q for q in quests
+                      if not is_enrolled(q) and not is_completed(q) and is_completable(q)]
+        if not unaccepted: return quests
+        log(f"Auto-accepting {len(unaccepted)} quest(s)...", "info")
         for q in unaccepted:
             self.enroll_quest(q)
             random_sleep(2, 5)
         human_sleep(2)
         return self.fetch_quests()
 
-    # ── Build QuestState from a raw quest dict ─────────────────────────────────
+    # ── State factory ──────────────────────────────────────────────────────
     def _make_state(self, quest: dict) -> Optional[QuestState]:
-        task_type = get_task_type(quest)
-        if not task_type:
-            return None
-        enrolled_at_str = get_enrolled_at(quest)
+        tt = get_task_type(quest)
+        if not tt: return None
+        ea = get_enrolled_at(quest)
         enrolled_ts = (
-            datetime.fromisoformat(enrolled_at_str.replace("Z", "+00:00")).timestamp()
-            if enrolled_at_str else time.time()
+            datetime.fromisoformat(ea.replace("Z", "+00:00")).timestamp()
+            if ea else time.time()
         )
-        seconds_done = get_seconds_done(quest)
-        seconds_needed = get_seconds_needed(quest)
+        sd = get_seconds_done(quest)
+        sn = get_seconds_needed(quest)
         return QuestState(
-            quest          = quest,
-            task_type      = task_type,
-            seconds_needed = seconds_needed,
-            seconds_done   = seconds_done,
-            enrolled_ts    = enrolled_ts,
-            name           = get_quest_name(quest),
-            completed      = seconds_done >= seconds_needed,
+            quest=quest, task_type=tt, seconds_needed=sn, seconds_done=sd,
+            enrolled_ts=enrolled_ts, name=get_quest_name(quest),
+            reward=get_quest_reward(quest),
+            completed=sd >= sn, status="done" if sd >= sn else "queued",
         )
 
-    # ── Video group: all WATCH_VIDEO* quests tick together every second ────────
+    # ── Video group ────────────────────────────────────────────────────────
     def _run_video_group(self, states: List[QuestState]):
-        """
-        Advance all video quests in a shared 1-second tick loop — exactly as the
-        browser extension does with its videoPromise.  Each quest sends its own
-        POST independently; they don't block each other.
-        """
-        log(f"🎬 Video group starting ({len(states)} quest(s))", "info")
+        log(f"Video group starting ({len(states)} quest(s))", "info")
         for s in states:
-            log(f"   • {C.BOLD}{s.name}{C.RESET}  {s.seconds_done:.0f}/{s.seconds_needed}s", "info")
+            log(f"  • {s.name}  {s.seconds_done:.0f}/{s.seconds_needed}s", "info")
+            s.status = "running"
 
         while True:
             all_done = True
             for state in states:
-                if state.completed:
-                    continue
+                if state.completed: continue
                 all_done = False
                 qid = state.quest["id"]
-
                 max_allowed = (time.time() - state.enrolled_ts) + VIDEO_MAX_FUTURE
-                diff        = max_allowed - state.seconds_done
-                if diff < VIDEO_SPEED:
-                    continue    # not enough real time has passed yet — skip this tick
-
-                timestamp = min(
-                    float(state.seconds_needed),
-                    state.seconds_done + VIDEO_SPEED + random.uniform(0, 0.5)
-                )
+                if max_allowed - state.seconds_done < VIDEO_SPEED: continue
+                timestamp = min(float(state.seconds_needed),
+                                state.seconds_done + VIDEO_SPEED + random.uniform(0, 0.5))
                 try:
                     r = self.api.post(f"/quests/{qid}/video-progress", {"timestamp": timestamp})
                     if r.status_code == 200:
                         body = r.json()
                         state.advance(timestamp)
-                        log(
-                            f"  🎬 [{state.name}] {state.seconds_done:.0f}/{state.seconds_needed}s "
-                            f"({state.pct:.0f}%)",
-                            "progress"
-                        )
+                        log(f"[{state.name}] {state.seconds_done:.0f}/{state.seconds_needed}s ({state.pct:.0f}%)", "progress")
                         if body.get("completed_at") or state.completed:
-                            # Final flush
-                            try:
-                                self.api.post(
-                                    f"/quests/{qid}/video-progress",
-                                    {"timestamp": state.seconds_needed}
-                                )
-                            except Exception:
-                                pass
-                            log(f"✅ Video done: {C.BOLD}{state.name}{C.RESET}", "ok")
-                            state.completed = True
+                            try: self.api.post(f"/quests/{qid}/video-progress", {"timestamp": state.seconds_needed})
+                            except Exception: pass
+                            log(f"Video done: {state.name}", "ok")
+                            state.status = "done"; state.completed = True
                             self.mark_completed(qid)
                     elif r.status_code == 429:
-                        _wait_for_rate_limit(r, context=state.name)
+                        _wait_for_rate_limit(r, state.name)
                     else:
-                        log(f"  Video error ({r.status_code}) [{state.name}]: {r.text[:200]}", "warn")
+                        log(f"Video error ({r.status_code}) [{state.name}]: {r.text[:200]}", "warn")
                 except Exception as e:
-                    log(f"  Video error [{state.name}]: {e}", "error")
-
-            if all_done:
-                break
+                    log(f"Video error [{state.name}]: {e}", "error")
+            if all_done: break
             time.sleep(VIDEO_TICK_INTERVAL)
 
-    # ── Heartbeat group: one thread per quest, each on its own interval ────────
+    # ── Heartbeat group ────────────────────────────────────────────────────
     def _run_heartbeat_group(self, states: List[QuestState]):
-        """
-        Spawn one worker thread per heartbeat quest so every quest gets a
-        heartbeat every HEARTBEAT_INTERVAL seconds — independent of how many
-        other quests are running.
-
-        Old round-robin: 2 quests × 20s interval = each quest heartbeats every 40s.
-        New per-thread:  2 quests × 20s interval = each quest heartbeats every 20s. ✓
-        """
-        log(f"🎮 Heartbeat group starting ({len(states)} quest(s), one thread each)", "info")
+        log(f"Heartbeat group starting ({len(states)} quest(s), one thread each)", "info")
 
         def _worker(state: QuestState):
-            qid = state.quest["id"]
-            pid = random.randint(1000, 30000)
+            qid        = state.quest["id"]
+            pid        = random.randint(1000, 30000)
             channel_id = random.randint(10**17, 10**18 - 1)
             stream_key = f"call:{channel_id}:{pid}"
-            emoji = "🕹️" if state.task_type == "PLAY_ACTIVITY" else "🎮"
-            log(
-                f"   {emoji} {C.BOLD}{state.name}{C.RESET}  "
-                f"~{state.remaining // 60:.0f}m remaining  [{state.task_type}]",
-                "info"
-            )
-
+            state.status = "running"
+            log(f"{state.name}  ~{state.remaining // 60:.0f}m remaining [{state.task_type}]", "info")
             while not state.completed:
                 try:
-                    r = self.api.post(f"/quests/{qid}/heartbeat", {
-                        "stream_key": stream_key,
-                        "terminal":   False,
-                    })
+                    r = self.api.post(f"/quests/{qid}/heartbeat",
+                                      {"stream_key": stream_key, "terminal": False})
                     if r.status_code == 200:
-                        body          = r.json()
-                        progress_data = body.get("progress", {})
-                        if progress_data and state.task_type in progress_data:
-                            state.advance(progress_data[state.task_type].get("value", state.seconds_done))
-                        log(
-                            f"  🎮 [{state.name}] {state.seconds_done:.0f}/{state.seconds_needed}s "
-                            f"({state.pct:.0f}%)",
-                            "progress"
-                        )
+                        body = r.json()
+                        pd   = body.get("progress", {})
+                        if pd and state.task_type in pd:
+                            state.advance(pd[state.task_type].get("value", state.seconds_done))
+                        log(f"[{state.name}] {state.seconds_done:.0f}/{state.seconds_needed}s ({state.pct:.0f}%)", "progress")
                         if body.get("completed_at") or state.completed:
-                            try:
-                                self.api.post(f"/quests/{qid}/heartbeat", {
-                                    "stream_key": stream_key,
-                                    "terminal":   True,
-                                })
-                            except Exception:
-                                pass
-                            log(f"✅ Heartbeat done: {C.BOLD}{state.name}{C.RESET}", "ok")
-                            state.completed = True
-                            self.mark_completed(qid)
-                            return
+                            try: self.api.post(f"/quests/{qid}/heartbeat",
+                                               {"stream_key": stream_key, "terminal": True})
+                            except Exception: pass
+                            log(f"Heartbeat done: {state.name}", "ok")
+                            state.status = "done"; state.completed = True
+                            self.mark_completed(qid); return
                     elif r.status_code == 429:
-                        _wait_for_rate_limit(r, context=state.name)
-                        continue   # retry immediately without sleeping the full interval
+                        _wait_for_rate_limit(r, state.name); continue
                     else:
-                        log(f"  Heartbeat error ({r.status_code}) [{state.name}]: {r.text[:200]}", "warn")
+                        log(f"Heartbeat error ({r.status_code}) [{state.name}]: {r.text[:200]}", "warn")
                 except Exception as e:
-                    log(f"  Heartbeat error [{state.name}]: {e}", "error")
-
+                    log(f"Heartbeat error [{state.name}]: {e}", "error")
                 human_sleep(HEARTBEAT_INTERVAL, pct=0.15)
 
-        workers = [
-            threading.Thread(target=_worker, args=(s,), name=f"HB-{s.name[:20]}", daemon=True)
-            for s in states
-        ]
-        for w in workers:
-            w.start()
-        for w in workers:
-            w.join()
+        workers = [threading.Thread(target=_worker, args=(s,),
+                                    name=f"HB-{s.name[:20]}", daemon=True)
+                   for s in states]
+        for w in workers: w.start()
+        for w in workers: w.join()
 
-    # ── Complete: ACHIEVEMENT_IN_ACTIVITY ─────────────────────────────────────
+    # ── Achievement (manual only) ──────────────────────────────────────────
     def _handle_achievement(self, quest: dict):
-        """
-        ACHIEVEMENT_IN_ACTIVITY quests are gated by the Discord Activities SDK.
-        Progress is only accepted from a live in-game session — no REST endpoint
-        exists to complete these externally. Skip and guide the user.
-        """
-        name       = get_quest_name(quest)
-        info       = get_activity_quest_info(quest)
-        app_id     = info.get("app_id", "?")
-        event_name = info.get("event_name", "progress")
-        target     = info.get("target", 1)
-        us         = get_user_status(quest)
-        already    = int(
-            (us.get("progress") or {})
-            .get("ACHIEVEMENT_IN_ACTIVITY", {})
-            .get("value", 0)
-        )
-        log(f"⏭️  Skipping \"{C.BOLD}{name}{C.RESET}\" [ACHIEVEMENT_IN_ACTIVITY — manual only]", "warn")
-        log(f"   Progress: {already}/{target}  |  event: {event_name}  |  app: {app_id}", "info")
-        log(
-            f"   ↳ Open Discord → find the Activity for this quest → "
-            f"play until '{event_name}' fires {target - already} more time(s).",
-            "info"
-        )
+        name  = get_quest_name(quest)
+        info  = get_activity_quest_info(quest)
+        us    = get_user_status(quest)
+        already = int((us.get("progress") or {})
+                      .get("ACHIEVEMENT_IN_ACTIVITY", {}).get("value", 0))
+        target  = info.get("target", 1)
+        ename   = info.get("event_name", "progress")
+        log(f'Skipping "{name}" [ACHIEVEMENT — manual only] {already}/{target}', "warn")
+        log(f"  ↳ Play Discord Activity until '{ename}' fires {target-already}x", "info")
 
-    # ── Run all actionable quests in parallel groups ───────────────────────────
+    # ── Run all ────────────────────────────────────────────────────────────
     def run_all_quests(self, quests: list):
-        """
-        Split actionable quests into video / heartbeat / achievement groups and
-        run video + heartbeat concurrently in separate threads — mirroring the
-        browser extension's Promise.all([videoPromise, heartbeatPromise]) design.
-        """
-        video_states      = []
-        heartbeat_states  = []
+        video_states, hb_states = [], []
+        all_states: List[QuestState] = []
 
         for quest in quests:
-            qid       = quest.get("id")
-            task_type = get_task_type(quest)
-            name      = get_quest_name(quest)
-
-            if self.is_already_done(qid):
-                continue
-
-            if not task_type:
-                raw_keys = get_raw_task_keys(quest)
-                if raw_keys:
-                    log(f"❓ \"{name}\" — unknown task type(s): {raw_keys}, skipping", "warn")
-                    log(
-                        f"   Tip: add '{raw_keys[0]}' to SUPPORTED_TASKS + "
-                        f"HEARTBEAT_TASKS or VIDEO_TASKS to enable it.",
-                        "info"
-                    )
-                else:
-                    log(f"❓ \"{name}\" — no tasks found, skipping", "warn")
-                continue
-
-            if task_type in ACHIEVEMENT_TASKS:
-                self._handle_achievement(quest)
-                continue    # don't track in completed_ids; re-check each scan
-
+            qid  = quest.get("id")
+            tt   = get_task_type(quest)
+            name = get_quest_name(quest)
+            if self.is_already_done(qid): continue
+            if not tt:
+                raw = get_raw_task_keys(quest)
+                log(f'"{name}" — unknown task {raw}, skipping', "warn"); continue
+            if tt in ACHIEVEMENT_TASKS:
+                self._handle_achievement(quest); continue
             state = self._make_state(quest)
-            if state is None or state.completed:
-                continue
+            if state is None or state.completed: continue
+            all_states.append(state)
+            if tt in VIDEO_TASKS: video_states.append(state)
+            elif tt in HEARTBEAT_TASKS: hb_states.append(state)
+            else: log(f"No handler for {tt} [{name}], skipping", "warn")
 
-            if task_type in VIDEO_TASKS:
-                video_states.append(state)
-            elif task_type in HEARTBEAT_TASKS:
-                heartbeat_states.append(state)
-            else:
-                log(f"  No handler for {task_type} [{name}], skipping", "warn")
+        if not all_states: return
 
-        if not video_states and not heartbeat_states:
-            return
+        # push all states to dashboard
+        if _dash: _dash.set_rows(all_states)
 
         threads = []
-
         if video_states:
-            t = threading.Thread(
-                target=self._run_video_group,
-                args=(video_states,),
-                name="VideoGroup",
-                daemon=True,
-            )
-            threads.append(t)
-
-        if heartbeat_states:
-            t = threading.Thread(
-                target=self._run_heartbeat_group,
-                args=(heartbeat_states,),
-                name="HeartbeatGroup",
-                daemon=True,
-            )
-            threads.append(t)
-
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
+            threads.append(threading.Thread(target=self._run_video_group,
+                                            args=(video_states,), name="VideoGroup", daemon=True))
+        if hb_states:
+            threads.append(threading.Thread(target=self._run_heartbeat_group,
+                                            args=(hb_states,), name="HeartbeatGroup", daemon=True))
+        for t in threads: t.start()
+        for t in threads: t.join()
         log("All quest groups finished.", "ok")
 
-    # ── Main loop ──────────────────────────────────────────────────────────────
+    # ── Main loop ──────────────────────────────────────────────────────────
     def run(self):
-        log("=" * 60, "info")
-        log(f"{C.BOLD}Discord Quest Auto-Completer (multi-quest){C.RESET}", "info")
-        log(f"Auto-accept: {'ON' if AUTO_ACCEPT else 'OFF'}  |  Poll: {POLL_INTERVAL}s", "info")
-        log("=" * 60, "info")
+        log("Discord Quest Auto-Completer started", "ok")
+        log(f"Auto-accept: {'ON' if AUTO_ACCEPT else 'OFF'}  Poll: {POLL_INTERVAL}s", "info")
         cycle = 0
+
         while True:
             cycle += 1
-            log(f"── Scan #{cycle} ──", "info")
+            if _dash: _dash.set_cycle(cycle)
+            log(f"Scan #{cycle}", "info")
+            if _dash: _dash.set_status("SCANNING...", ok=True)
+
             quests = self.fetch_quests()
+
             if not quests:
                 log("No quests found", "info")
+                if _dash: _dash.set_rows([])
             else:
-                total             = len(quests)
-                enrolled_count    = sum(1 for q in quests if is_enrolled(q))
-                completed_count   = sum(1 for q in quests if is_completed(q))
-                completable_count = sum(1 for q in quests if is_completable(q))
-                log(
-                    f"Total: {total} | Enrolled: {enrolled_count} | "
-                    f"Completed: {completed_count} | Completable: {completable_count}",
-                    "info"
-                )
-                for q in quests:
-                    name  = get_quest_name(q)
-                    task  = get_task_type(q)
-                    task_label = task if task else (
-                        f"? ({', '.join(get_raw_task_keys(q))})" if get_raw_task_keys(q) else "?"
-                    )
-                    if is_completed(q):
-                        status = f"{C.GREEN}✓{C.RESET}"
-                    elif is_enrolled(q):
-                        status = f"{C.YELLOW}▶{C.RESET}"
-                    else:
-                        status = f"{C.DIM}○{C.RESET}"
+                total     = len(quests)
+                enrolled  = sum(1 for q in quests if is_enrolled(q))
+                completed = sum(1 for q in quests if is_completed(q))
+                log(f"Total: {total}  Enrolled: {enrolled}  Completed: {completed}", "info")
 
-                    # Expiry warning
-                    expiry_tag = ""
+                # log each quest (dashboard shows table, so keep these brief)
+                for q in quests:
+                    name = get_quest_name(q)
+                    tt   = get_task_type(q)
+                    mark = "✓" if is_completed(q) else ("▶" if is_enrolled(q) else "○")
                     expires = get_expires_at(q)
+                    expiry_note = ""
                     if expires and not is_completed(q):
                         try:
-                            exp_dt    = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-                            hours_left = (exp_dt - datetime.now(timezone.utc)).total_seconds() / 3600
-                            if hours_left < 1:
-                                expiry_tag = f" {C.RED}⚠ expires in {hours_left*60:.0f}m!{C.RESET}"
-                            elif hours_left < 6:
-                                expiry_tag = f" {C.YELLOW}⚠ expires in {hours_left:.1f}h{C.RESET}"
-                        except Exception:
-                            pass
+                            h = (datetime.fromisoformat(expires.replace("Z", "+00:00"))
+                                 - datetime.now(timezone.utc)).total_seconds() / 3600
+                            if h < 1:   expiry_note = f" ⚠ {h*60:.0f}m left!"
+                            elif h < 6: expiry_note = f" ⚠ {h:.1f}h left"
+                        except Exception: pass
+                    log(f"  {mark} {name} [{tt or '?'}]{expiry_note}", "info")
 
-                    log(f"  {status} {name} [{task_label}]{expiry_tag}", "info")
+                quests     = self.auto_accept(quests)
+                actionable = [q for q in quests
+                              if is_enrolled(q) and not is_completed(q)
+                              and is_completable(q) and not self.is_already_done(q.get("id"))]
 
-                quests    = self.auto_accept(quests)
-                actionable = [
-                    q for q in quests
-                    if is_enrolled(q)
-                    and not is_completed(q)
-                    and is_completable(q)
-                    and not self.is_already_done(q.get("id"))
-                ]
                 if actionable:
-                    log(f"\n{len(actionable)} quest(s) ready — running in parallel groups", "info")
-                    t_start = time.time()
+                    log(f"{len(actionable)} quest(s) ready — launching parallel groups", "info")
+                    if _dash: _dash.set_status("RUNNING QUESTS...", ok=True)
+                    t0 = time.time()
                     self.run_all_quests(actionable)
-                    elapsed = time.time() - t_start
-                    # ── Completion summary ────────────────────────────────────
-                    done_this_run = [q for q in actionable if self.is_already_done(q.get("id"))]
-                    log("─" * 50, "info")
-                    log(f"Session summary  ({elapsed/60:.1f}m elapsed)", "info")
+                    elapsed = time.time() - t0
+
+                    # summary
+                    done_n = sum(1 for q in actionable if self.is_already_done(q.get("id")))
+                    log(f"Session done: {done_n}/{len(actionable)} completed in {elapsed/60:.1f}m", "ok")
                     for q in actionable:
-                        qid  = q.get("id")
-                        name = get_quest_name(q)
-                        mark = f"{C.GREEN}✅ done{C.RESET}" if self.is_already_done(qid) else f"{C.YELLOW}⏳ in progress{C.RESET}"
-                        log(f"  {mark}  {name}", "info")
-                    log("─" * 50, "info")
+                        mark = "✅" if self.is_already_done(q.get("id")) else "⏳"
+                        log(f"  {mark} {get_quest_name(q)}", "info")
                 else:
-                    log("No quests need completion at this time", "info")
+                    log("No quests need completion right now", "info")
+                    if _dash: _dash.set_rows([])
 
             wait = jitter(POLL_INTERVAL, 0.10)
-            log(f"\nWaiting {wait:.0f}s... (Ctrl+C to stop)\n", "info")
+            if _dash:
+                _dash.set_status("SYSTEM RUNNING...", ok=True)
+                _dash.set_next_scan(time.time() + wait)
+            log(f"Waiting {wait:.0f}s...", "info")
             time.sleep(wait)
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Entry point
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
-    print(f"""
-{C.BOLD}{C.CYAN}╔══════════════════════════════════════════════╗
-║     Discord Quest Auto-Completer             ║
-║  Auto‑scan · Auto‑enroll · Auto‑complete     ║
-╚══════════════════════════════════════════════╝{C.RESET}
-""")
-    build_number = fetch_latest_build_number()
-    api          = DiscordAPI(TOKEN, build_number)
-    if not api.validate_token():
-        sys.exit(1)
-    completer = QuestAutocompleter(api)
+    global _dash
+
+    _dash = Dashboard()
+    _dash.set_status("INITIALIZING...", ok=False)
+    _dash.start()
+
     try:
+        log("Fetching build number...", "info")
+        build_number = fetch_latest_build_number()
+        api          = DiscordAPI(TOKEN, build_number)
+        if not api.validate_token():
+            _dash.stop()
+            sys.exit(1)
+        completer = QuestAutocompleter(api)
         completer.run()
     except KeyboardInterrupt:
-        print()
-        log("Stopped.", "info")
-        sys.exit(0)
+        pass
+    finally:
+        _dash.stop()
+        print(f"\n{A.GRN}Stopped.{A.RST}")
 
 if __name__ == "__main__":
     main()
