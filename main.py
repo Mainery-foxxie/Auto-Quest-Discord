@@ -605,43 +605,102 @@ def get_quest_name(quest: dict) -> str:
         return app_name
     return f"Quest#{quest.get('id', '?')}"
 
+def _dump_quest_debug(quests: list):
+    """
+    Write raw quest JSON to quest_debug.json on first fetch.
+    Delete that file to re-dump next run.
+    """
+    path = "quest_debug.json"
+    if os.path.exists(path):
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(quests, f, indent=2, default=str)
+        log(f"Raw quest data saved → {path}  (delete to re-dump)", "warn")
+    except Exception as e:
+        log(f"Could not write {path}: {e}", "warn")
+
+
+def _walk_for_reward(obj, depth: int = 0) -> Optional[str]:
+    """
+    Recursively walk any dict/list looking for a value attached to a
+    reward-flavoured key. Returns the first short string hit, or None.
+    """
+    if depth > 6:
+        return None
+    _REWARD_KEYS = {
+        "name", "label", "title", "displayName", "display_name", "item_name",
+        "rewardDescription", "reward_description", "rewardTitle", "reward_title",
+        "rewardName", "reward_name", "prizeDescription", "prize_title",
+        "assetName", "asset_name",
+    }
+    _REWARD_CONTAINERS = {
+        "reward", "rewards", "rewardItems", "reward_items", "prize", "prizes",
+        "items", "entitlements", "subscription_plan",
+    }
+    if isinstance(obj, dict):
+        # direct string values on reward-flavoured keys
+        for k, v in obj.items():
+            if k in _REWARD_KEYS and isinstance(v, str) and v.strip():
+                return v.strip()
+        # recurse into reward-container keys first (priority)
+        for k in _REWARD_CONTAINERS:
+            if k in obj:
+                hit = _walk_for_reward(obj[k], depth + 1)
+                if hit:
+                    return hit
+        # recurse into everything else
+        for k, v in obj.items():
+            if k not in _REWARD_CONTAINERS:
+                hit = _walk_for_reward(v, depth + 1)
+                if hit:
+                    return hit
+    elif isinstance(obj, list):
+        for item in obj[:3]:   # only first 3 items
+            hit = _walk_for_reward(item, depth + 1)
+            if hit:
+                return hit
+    return None
+
+
 def get_quest_reward(quest: dict) -> str:
     """
-    Multi-strategy reward extraction – walks every common field Discord uses.
-    Returns a human-readable label or '—' if nothing is found.
+    Multi-strategy reward extraction.
+    Falls back to a full recursive tree-walk as last resort.
     """
     cfg  = quest.get("config", {})
     msgs = cfg.get("messages", {})
 
     # ── Strategy 1: structured reward list ─────────────────────────────────
-    for key in ("rewardItems", "reward_items", "rewards", "prize", "prizes"):
+    for key in ("rewardItems", "reward_items", "rewards", "prize", "prizes",
+                "items", "entitlements"):
         items = cfg.get(key)
         if not items or not isinstance(items, list):
             continue
         item = items[0]
         if not isinstance(item, dict):
-            if isinstance(item, str):
+            if isinstance(item, str) and item.strip():
                 return item.strip()
             continue
-        for field in ("name", "label", "item_name", "title", "description",
-                      "displayName", "display_name"):
-            v = item.get(field)
+        for f in ("name", "label", "item_name", "title", "description",
+                  "displayName", "display_name", "assetName"):
+            v = item.get(f)
             if v and isinstance(v, str):
                 return v.strip()
-        # nested: item.reward.name
-        nested = item.get("reward") or item.get("item")
-        if isinstance(nested, dict):
-            for field in ("name", "label", "display_name"):
-                v = nested.get(field)
-                if v and isinstance(v, str):
-                    return v.strip()
+        for nkey in ("reward", "item", "sku", "product"):
+            nested = item.get(nkey)
+            if isinstance(nested, dict):
+                for f in ("name", "label", "display_name", "title"):
+                    v = nested.get(f)
+                    if v and isinstance(v, str):
+                        return v.strip()
 
     # ── Strategy 2: top-level reward object ────────────────────────────────
     for key in ("reward", "prize"):
         obj = cfg.get(key)
         if isinstance(obj, dict):
-            for field in ("name", "label", "display_name", "title"):
-                v = obj.get(field)
+            for f in ("name", "label", "display_name", "title"):
+                v = obj.get(f)
                 if v and isinstance(v, str):
                     return v.strip()
         elif isinstance(obj, str) and obj.strip():
@@ -650,12 +709,12 @@ def get_quest_reward(quest: dict) -> str:
     # ── Strategy 3: messages fields ────────────────────────────────────────
     for key in ("rewardDescription", "reward_description", "rewardTitle",
                 "reward_title", "rewardName", "reward_name", "reward",
-                "prizeDescription", "prize_title"):
+                "prizeDescription", "prize_title", "itemName", "item_name"):
         v = msgs.get(key)
         if v and isinstance(v, str):
             return v.strip()
 
-    # ── Strategy 4: task config may carry the reward ───────────────────────
+    # ── Strategy 4: task config ────────────────────────────────────────────
     tc = get_task_config(quest)
     if tc:
         for key in ("reward", "prize", "rewardDescription"):
@@ -666,6 +725,11 @@ def get_quest_reward(quest: dict) -> str:
                 name = v.get("name") or v.get("label")
                 if name:
                     return str(name).strip()
+
+    # ── Strategy 5: recursive tree-walk (last resort) ──────────────────────
+    hit = _walk_for_reward(cfg)
+    if hit and len(hit) < 80:   # sanity-check length
+        return hit
 
     return "—"
 
@@ -774,8 +838,12 @@ class QuestAutocompleter:
                         blocked = _get(data, "quest_enrollment_blocked_until")
                         if blocked:
                             log(f"Enrollment blocked until: {blocked}", "warn")
-                        return data.get("quests", [])
-                    return data if isinstance(data, list) else []
+                        quests_raw = data.get("quests", [])
+                        _dump_quest_debug(quests_raw)
+                        return quests_raw
+                    result = data if isinstance(data, list) else []
+                    _dump_quest_debug(result)
+                    return result
                 elif r.status_code == 429:
                     if attempt >= MAX_FETCH_RETRIES:
                         log("Max fetch retries reached.", "error"); return []
