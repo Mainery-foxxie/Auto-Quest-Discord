@@ -621,57 +621,119 @@ def _dump_quest_debug(quests: list):
         log(f"Could not write {path}: {e}", "warn")
 
 
-def _walk_for_reward(obj, depth: int = 0) -> Optional[str]:
+def _orb_label(item: dict) -> Optional[str]:
     """
-    Recursively walk any dict/list looking for a value attached to a
-    reward-flavoured key. Returns the first short string hit, or None.
+    Discord Orb rewards look like {"type": "DISCORD_PRODUCT", "amount": 700}.
+    Detect any integer/float amount field and return "N Discord Orbs".
+    Also handles {"currency": "orbs", "quantity": 700} and similar shapes.
+    """
+    amount = None
+    for k in ("amount", "quantity", "count", "value"):
+        v = item.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            amount = int(v); break
+    if amount is None:
+        return None
+    # confirm it looks like an orb/currency reward, not e.g. a duration
+    rtype = str(item.get("type", "") or item.get("currency", "") or "").upper()
+    is_orb = any(x in rtype for x in ("ORB", "DISCORD_PRODUCT", "CREDIT", "COIN", "TOKEN"))
+    if is_orb or amount >= 100:   # ≥100 is almost certainly orbs not seconds
+        return f"{amount} Discord Orbs"
+    return None
+
+
+# Keys that belong to the application/game metadata — never the reward
+_APP_KEYS = {"application", "app", "game", "publisher", "developer", "guild"}
+
+# Keys whose string values ARE reward names
+_REWARD_NAME_KEYS = {
+    "rewardDescription", "reward_description",
+    "rewardTitle",       "reward_title",
+    "rewardName",        "reward_name",
+    "prizeDescription",  "prize_title",
+    "displayName",       "display_name",
+    "item_name",         "itemName",
+    "label",
+}
+
+# Keys that are reward containers (walk these first)
+_REWARD_CONTAINERS = {
+    "reward", "rewards", "rewardItems", "reward_items",
+    "prize", "prizes", "items", "entitlements",
+}
+
+
+def _walk_for_reward(obj, depth: int = 0, _skip_app: bool = True) -> Optional[str]:
+    """
+    Recursively walk a dict/list looking for an orb amount or a string
+    on a reward-name key.  Skips application/game subtrees so we never
+    accidentally return the game title as the reward.
     """
     if depth > 6:
         return None
-    _REWARD_KEYS = {
-        "name", "label", "title", "displayName", "display_name", "item_name",
-        "rewardDescription", "reward_description", "rewardTitle", "reward_title",
-        "rewardName", "reward_name", "prizeDescription", "prize_title",
-        "assetName", "asset_name",
-    }
-    _REWARD_CONTAINERS = {
-        "reward", "rewards", "rewardItems", "reward_items", "prize", "prizes",
-        "items", "entitlements", "subscription_plan",
-    }
+
     if isinstance(obj, dict):
-        # direct string values on reward-flavoured keys
+        # ── orb / integer amount check first ──────────────────────────────
+        orb = _orb_label(obj)
+        if orb:
+            return orb
+
+        # ── string values on explicit reward-name keys ────────────────────
         for k, v in obj.items():
-            if k in _REWARD_KEYS and isinstance(v, str) and v.strip():
+            if k in _REWARD_NAME_KEYS and isinstance(v, str) and v.strip():
                 return v.strip()
-        # recurse into reward-container keys first (priority)
+
+        # ── recurse into reward containers (priority) ─────────────────────
         for k in _REWARD_CONTAINERS:
             if k in obj:
                 hit = _walk_for_reward(obj[k], depth + 1)
                 if hit:
                     return hit
-        # recurse into everything else
+
+        # ── recurse into everything else, skipping app/game keys ──────────
         for k, v in obj.items():
-            if k not in _REWARD_CONTAINERS:
-                hit = _walk_for_reward(v, depth + 1)
-                if hit:
-                    return hit
+            if k in _REWARD_CONTAINERS or (_skip_app and k in _APP_KEYS):
+                continue
+            hit = _walk_for_reward(v, depth + 1)
+            if hit:
+                return hit
+
     elif isinstance(obj, list):
-        for item in obj[:3]:   # only first 3 items
+        for item in obj[:5]:
             hit = _walk_for_reward(item, depth + 1)
             if hit:
                 return hit
+
     return None
 
 
 def get_quest_reward(quest: dict) -> str:
     """
-    Multi-strategy reward extraction.
-    Falls back to a full recursive tree-walk as last resort.
+    Extracts the human-readable reward label from a Discord quest.
+
+    Priority order:
+      1. messages.rewardDescription / rewardTitle / rewardName  (most reliable)
+      2. rewards[] list  – orb amount OR string name fields
+      3. top-level reward / prize object
+      4. task config
+      5. recursive tree-walk (last resort, skips application subtree)
     """
     cfg  = quest.get("config", {})
     msgs = cfg.get("messages", {})
 
-    # ── Strategy 1: structured reward list ─────────────────────────────────
+    # ── 1. Message fields (Discord always populates these for display) ──────
+    for key in (
+        "rewardDescription", "reward_description",
+        "rewardTitle",       "reward_title",
+        "rewardName",        "reward_name",
+        "prizeDescription",  "prize_title",
+        "itemName",          "item_name",
+    ):
+        v = msgs.get(key)
+        if v and isinstance(v, str):
+            return v.strip()
+
+    # ── 2. Structured reward list ───────────────────────────────────────────
     for key in ("rewardItems", "reward_items", "rewards", "prize", "prizes",
                 "items", "entitlements"):
         items = cfg.get(key)
@@ -682,39 +744,46 @@ def get_quest_reward(quest: dict) -> str:
             if isinstance(item, str) and item.strip():
                 return item.strip()
             continue
-        for f in ("name", "label", "item_name", "title", "description",
-                  "displayName", "display_name", "assetName"):
+
+        # orb / integer amount
+        orb = _orb_label(item)
+        if orb:
+            return orb
+
+        # string name fields (NOT "name" alone – too generic, catches app names)
+        for f in ("label", "item_name", "itemName", "displayName",
+                  "display_name", "rewardName", "assetName"):
             v = item.get(f)
             if v and isinstance(v, str):
                 return v.strip()
-        for nkey in ("reward", "item", "sku", "product"):
+
+        # nested reward / sku / product
+        for nkey in ("reward", "sku", "product", "item"):
             nested = item.get(nkey)
             if isinstance(nested, dict):
+                orb2 = _orb_label(nested)
+                if orb2:
+                    return orb2
                 for f in ("name", "label", "display_name", "title"):
                     v = nested.get(f)
                     if v and isinstance(v, str):
                         return v.strip()
 
-    # ── Strategy 2: top-level reward object ────────────────────────────────
+    # ── 3. Top-level reward / prize object ──────────────────────────────────
     for key in ("reward", "prize"):
         obj = cfg.get(key)
         if isinstance(obj, dict):
-            for f in ("name", "label", "display_name", "title"):
+            orb = _orb_label(obj)
+            if orb:
+                return orb
+            for f in ("label", "display_name", "displayName", "rewardName"):
                 v = obj.get(f)
                 if v and isinstance(v, str):
                     return v.strip()
         elif isinstance(obj, str) and obj.strip():
             return obj.strip()
 
-    # ── Strategy 3: messages fields ────────────────────────────────────────
-    for key in ("rewardDescription", "reward_description", "rewardTitle",
-                "reward_title", "rewardName", "reward_name", "reward",
-                "prizeDescription", "prize_title", "itemName", "item_name"):
-        v = msgs.get(key)
-        if v and isinstance(v, str):
-            return v.strip()
-
-    # ── Strategy 4: task config ────────────────────────────────────────────
+    # ── 4. Task config ───────────────────────────────────────────────────────
     tc = get_task_config(quest)
     if tc:
         for key in ("reward", "prize", "rewardDescription"):
@@ -722,13 +791,17 @@ def get_quest_reward(quest: dict) -> str:
             if isinstance(v, str) and v.strip():
                 return v.strip()
             if isinstance(v, dict):
-                name = v.get("name") or v.get("label")
-                if name:
-                    return str(name).strip()
+                orb = _orb_label(v)
+                if orb:
+                    return orb
+                for f in ("name", "label"):
+                    nm = v.get(f)
+                    if nm:
+                        return str(nm).strip()
 
-    # ── Strategy 5: recursive tree-walk (last resort) ──────────────────────
+    # ── 5. Recursive tree-walk (last resort, skips application subtree) ──────
     hit = _walk_for_reward(cfg)
-    if hit and len(hit) < 80:   # sanity-check length
+    if hit and len(hit) < 80:
         return hit
 
     return "—"
