@@ -579,9 +579,7 @@ class DiscordAPI:
                 if _dash:
                     _dash.set_status("SYSTEM RUNNING...", ok=True)
                 return uname
-            log(f"Invalid token (status {r.status_code})", "error")
-            if _dash:
-                _dash.set_status("AUTH FAILED", ok=False)
+            log(f"Invalid token (status {r.status_code}) — skipping this account", "error")
             return None
         except Exception as e:
             log(f"Cannot connect to Discord: {e}", "error")
@@ -941,7 +939,7 @@ class QuestAutocompleter:
                       if not is_enrolled(q) and not is_completed(q) and is_completable(q)]
         if not unaccepted:
             return quests
-        log(f"Auto-accepting {len(unaccepted, account=self.account)} quest(s)...", "info")
+        log(f"Auto-accepting {len(unaccepted)} quest(s)...", "info", account=self.account)
         for q in unaccepted:
             self.enroll_quest(q)
             random_sleep(2, 5)
@@ -969,7 +967,7 @@ class QuestAutocompleter:
 
     # ── Video group ────────────────────────────────────────────────────────
     def _run_video_group(self, states: List[QuestState]):
-        log(f"Video group starting ({len(states, account=self.account)} quest(s))", "info")
+        log(f"Video group starting ({len(states)} quest(s))", "info", account=self.account)
         for s in states:
             log(f"  • {s.name}  {s.seconds_done:.0f}/{s.seconds_needed}s", "info", account=self.account)
             s.status = "running"
@@ -1031,7 +1029,7 @@ class QuestAutocompleter:
 
     # ── Heartbeat group ────────────────────────────────────────────────────
     def _run_heartbeat_group(self, states: List[QuestState]):
-        log(f"Heartbeat group starting ({len(states, account=self.account)} quest(s), one thread each)", "info")
+        log(f"Heartbeat group starting ({len(states)} quest(s), one thread each)", "info", account=self.account)
 
         def _worker(state: QuestState):
             qid = state.quest["id"]
@@ -1198,13 +1196,13 @@ class QuestAutocompleter:
                 ]
 
                 if actionable:
-                    log(f"{len(actionable, account=self.account)} quest(s) ready — launching parallel groups", "info")
+                    log(f"{len(actionable)} quest(s) ready — launching parallel groups", "info", account=self.account)
                     if _dash: _dash.set_status("RUNNING QUESTS...", ok=True)
                     t0 = time.time()
                     self.run_all_quests(actionable)
                     elapsed = time.time() - t0
                     done_n  = sum(1 for q in actionable if self.is_already_done(q.get("id")))
-                    log(f"Session done: {done_n}/{len(actionable, account=self.account)} in {elapsed/60:.1f}m", "ok")
+                    log(f"Session done: {done_n}/{len(actionable)} in {elapsed/60:.1f}m", "ok", account=self.account)
                     for q in actionable:
                         mark = "✅" if self.is_already_done(q.get("id")) else "⏳"
                         log(f"  {mark} {get_quest_name(q, account=self.account)}", "info")
@@ -1228,8 +1226,10 @@ def _run_account(token: str, build_number: int, failed_accounts: list, lock: thr
     api      = DiscordAPI(token, build_number)
     username = api.validate_token()
     if username is None:
+        short = token[:20] + "..."
         with lock:
-            failed_accounts.append(token[:20] + "...")
+            failed_accounts.append(short)
+        log(f"Skipping invalid token ({short}) — other accounts continue", "warn")
         return
     if _dash:
         _dash.set_user(username, "")
