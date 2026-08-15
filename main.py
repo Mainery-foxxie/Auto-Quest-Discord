@@ -1219,19 +1219,27 @@ def main():
     _dash.set_status("INITIALIZING...", ok=False)
     _dash.start()
 
+    _exit_reason: Optional[str] = None
     try:
         log("Fetching build number...", "info")
         build_number = fetch_latest_build_number()
         api          = DiscordAPI(TOKEN, build_number)
         if not api.validate_token():
-            _dash.stop()
-            sys.exit(1)
-        completer = QuestAutocompleter(api)
-        completer.run()
+            _exit_reason = "Token validation failed — check TOKEN_DISCORD in config.json"
+        else:
+            completer = QuestAutocompleter(api)
+            completer.run()
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        _exit_reason = f"Unexpected error: {e}"
+        if DEBUG:
+            traceback.print_exc()
     finally:
         _dash.stop()
+        if _exit_reason:
+            print(f"\n{A.RED}X {_exit_reason}{A.RST}")
+            sys.exit(1)
         print(f"\n{A.GRN}Stopped.{A.RST}")
 
 if __name__ == "__main__":
