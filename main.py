@@ -381,7 +381,7 @@ POLL_INTERVAL      = config.get("POLL_INTERVAL", 60)
 HEARTBEAT_INTERVAL = config.get("HEARTBEAT_INTERVAL", 20)
 AUTO_ACCEPT        = config.get("AUTO_ACCEPT", True)
 LOG_PROGRESS       = config.get("LOG_PROGRESS", True)
-DEBUG              = config.get("DEBUG", False)
+DEBUG              = config.get("DEBUG", True)   # temp: on for bounty research
 
 SUPPORTED_TASKS = [
     "WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP",
@@ -874,6 +874,15 @@ class QuestAutocompleter:
 
     # ── Fetch ──────────────────────────────────────────────────────────────
     def fetch_quests(self) -> list:
+        # Probe extra endpoints once for debug info
+        _PROBE = ["/quests/@me", "/bounties/@me", "/users/@me/quests", "/users/@me/bounties"]
+        for ep in _PROBE:
+            try:
+                pr = self.api.get(ep)
+                log(f"[PROBE] {ep} → {pr.status_code} | {pr.text[:120]}", "debug", account=self.account)
+            except Exception as pe:
+                log(f"[PROBE] {ep} → ERROR: {pe}", "debug", account=self.account)
+
         for attempt in range(1, MAX_FETCH_RETRIES + 1):
             try:
                 r = self.api.get("/quests/@me")
@@ -883,8 +892,17 @@ class QuestAutocompleter:
                         blocked = _get(data, "quest_enrollment_blocked_until")
                         if blocked:
                             log(f"Enrollment blocked until: {blocked}", "warn", account=self.account)
+                        # Log all top-level keys so we can see bounty fields
+                        log(f"[DEBUG] Response keys: {list(data.keys())}", "debug", account=self.account)
                         quests_raw = data.get("quests", [])
                         _dump_quest_debug(quests_raw)
+                        # Also dump full raw response for bounty research
+                        try:
+                            with open("full_response_debug.json", "w") as _f:
+                                json.dump(data, _f, indent=2, default=str)
+                            log("Full response saved → full_response_debug.json", "debug", account=self.account)
+                        except Exception:
+                            pass
                         return quests_raw
                     result = data if isinstance(data, list) else []
                     _dump_quest_debug(result)
@@ -894,7 +912,7 @@ class QuestAutocompleter:
                         log("Max fetch retries reached.", "error", account=self.account); return []
                     _wait_for_rate_limit(r, f"fetch {attempt}/{MAX_FETCH_RETRIES}")
                 else:
-                    log(f"Quest fetch error ({r.status_code}, account=self.account): {r.text[:200]}", "warn")
+                    log(f"Quest fetch error ({r.status_code}): {r.text[:200]}", "warn", account=self.account)
                     return []
             except Exception as e:
                 log(f"Error fetching quests: {e}", "error", account=self.account)
