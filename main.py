@@ -1228,9 +1228,19 @@ def _run_account(token: str, build_number: int, failed_accounts: list, lock: thr
     if username is None:
         short = token[:20] + "..."
         with lock:
-            failed_accounts.append(short)
-        log(f"Skipping invalid token ({short}) — other accounts continue", "warn")
-        return
+            if short not in failed_accounts:
+                failed_accounts.append(short)
+        log(f"Invalid token ({short}) — will keep retrying every {POLL_INTERVAL}s", "warn")
+        while True:
+            time.sleep(POLL_INTERVAL)
+            username = api.validate_token()
+            if username is not None:
+                log(f"Token recovered: {username}", "ok")
+                with lock:
+                    if short in failed_accounts:
+                        failed_accounts.remove(short)
+                break
+            log(f"Still invalid ({short}) — retrying...", "warn")
     if _dash:
         _dash.set_user(username, "")
     completer = QuestAutocompleter(api, account=username)
