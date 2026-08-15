@@ -365,9 +365,16 @@ def load_config():
 
 config = load_config()
 
-TOKEN = config.get("TOKEN_DISCORD", "")
-if not TOKEN:
-    print("❌ TOKEN_DISCORD not set in config.json")
+# Support both single token (legacy) and multi-account list
+_raw_tokens = config.get("TOKENS", None)
+if _raw_tokens is None:
+    # legacy single-token key
+    _single = config.get("TOKEN_DISCORD", "")
+    _raw_tokens = [_single] if _single else []
+
+TOKENS: List[str] = [t.strip() for t in _raw_tokens if isinstance(t, str) and t.strip()]
+if not TOKENS:
+    print("❌ No tokens found in config.json. Add \"TOKENS\": [\"token1\", \"token2\"]")
     sys.exit(1)
 
 POLL_INTERVAL      = config.get("POLL_INTERVAL", 60)
@@ -389,15 +396,16 @@ VIDEO_TASKS       = {"WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE", "WATCH_VIDEO_ON_DES
 # ─────────────────────────────────────────────────────────────────────────────
 #  Logging
 # ─────────────────────────────────────────────────────────────────────────────
-def log(msg: str, level: str = "info"):
+def log(msg: str, level: str = "info", account: str = ""):
     if level == "debug" and not DEBUG:
         return
     if level == "progress" and not LOG_PROGRESS:
         return
     clean = re.sub(r'\033\[[^m]*m', '', msg)
     ts = datetime.now().strftime("%H:%M:%S")
+    prefix = f"[{account}] " if account else ""
     if _dash:
-        _dash.add_log(ts, level, clean)
+        _dash.add_log(ts, level, f"{prefix}{clean}")
     else:
         pfx = {
             "info":     f"{A.CYN}[INFO]{A.RST}",
@@ -407,7 +415,8 @@ def log(msg: str, level: str = "info"):
             "progress": f"{A.DIM}[PROG]{A.RST}",
             "debug":    f"{A.DIM}[ DBG]{A.RST}",
         }.get(level, f"[{level.upper()}]")
-        print(f"{A.DIM}{ts}{A.RST} {pfx} {msg}")
+        acc_tag = f"{A.MAG}[{account}]{A.RST} " if account else ""
+        print(f"{A.DIM}{ts}{A.RST} {pfx} {acc_tag}{msg}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -557,7 +566,8 @@ class DiscordAPI:
         log(f"  -> {r.status_code}", "debug")
         return r
 
-    def validate_token(self) -> bool:
+    def validate_token(self) -> Optional[str]:
+        """Returns username on success, None on failure."""
         try:
             r = self.get("/users/@me")
             if r.status_code == 200:
@@ -566,16 +576,15 @@ class DiscordAPI:
                 uid   = str(user.get("id", "?"))
                 log(f"Logged in as: {uname} (ID: {uid})", "ok")
                 if _dash:
-                    _dash.set_user(uname, uid)
                     _dash.set_status("SYSTEM RUNNING...", ok=True)
-                return True
+                return uname
             log(f"Invalid token (status {r.status_code})", "error")
             if _dash:
                 _dash.set_status("AUTH FAILED", ok=False)
-            return False
+            return None
         except Exception as e:
             log(f"Cannot connect to Discord: {e}", "error")
-            return False
+            return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -850,8 +859,9 @@ def get_enrolled_at(quest: dict) -> Optional[str]:
 #  Core logic
 # ─────────────────────────────────────────────────────────────────────────────
 class QuestAutocompleter:
-    def __init__(self, api: DiscordAPI):
+    def __init__(self, api: DiscordAPI, account: str = ""):
         self.api             = api
+        self.account         = account   # display name for log prefixing
         self._completed_ids: set = set()
         self._ids_lock       = threading.Lock()
 
@@ -873,7 +883,7 @@ class QuestAutocompleter:
                     if isinstance(data, dict):
                         blocked = _get(data, "quest_enrollment_blocked_until")
                         if blocked:
-                            log(f"Enrollment blocked until: {blocked}", "warn")
+                            log(f"Enrollment blocked until: {blocked}", "warn", account=self.account)
                         quests_raw = data.get("quests", [])
                         _dump_quest_debug(quests_raw)
                         return quests_raw
@@ -882,13 +892,13 @@ class QuestAutocompleter:
                     return result
                 elif r.status_code == 429:
                     if attempt >= MAX_FETCH_RETRIES:
-                        log("Max fetch retries reached.", "error"); return []
+                        log("Max fetch retries reached.", "error", account=self.account); return []
                     _wait_for_rate_limit(r, f"fetch {attempt}/{MAX_FETCH_RETRIES}")
                 else:
-                    log(f"Quest fetch error ({r.status_code}): {r.text[:200]}", "warn")
+                    log(f"Quest fetch error ({r.status_code}, account=self.account): {r.text[:200]}", "warn")
                     return []
             except Exception as e:
-                log(f"Error fetching quests: {e}", "error")
+                log(f"Error fetching quests: {e}", "error", account=self.account)
                 if DEBUG:
                     traceback.print_exc()
                 return []
@@ -911,14 +921,14 @@ class QuestAutocompleter:
                 })
                 if r.status_code == 429:
                     if attempt >= 3:
-                        log(f'Skipping "{name}" after 3 rate limits', "warn"); return False
+                        log(f'Skipping "{name}" after 3 rate limits', "warn", account=self.account); return False
                     _wait_for_rate_limit(r, f'enrolling "{name}" {attempt}/3'); continue
                 if r.status_code in (200, 201, 204):
-                    log(f"Enrolled: {name}", "ok"); return True
-                log(f'Enroll "{name}" failed ({r.status_code}): {r.text[:200]}', "warn")
+                    log(f"Enrolled: {name}", "ok", account=self.account); return True
+                log(f'Enroll "{name}" failed ({r.status_code}, account=self.account): {r.text[:200]}', "warn")
                 return False
             except Exception as e:
-                log(f'Error enrolling "{name}" ({attempt}/3): {e}', "error")
+                log(f'Error enrolling "{name}" ({attempt}/3, account=self.account): {e}', "error")
                 if attempt >= 3: return False
                 time.sleep(random.uniform(1, 3))
         return False
@@ -930,7 +940,7 @@ class QuestAutocompleter:
                       if not is_enrolled(q) and not is_completed(q) and is_completable(q)]
         if not unaccepted:
             return quests
-        log(f"Auto-accepting {len(unaccepted)} quest(s)...", "info")
+        log(f"Auto-accepting {len(unaccepted, account=self.account)} quest(s)...", "info")
         for q in unaccepted:
             self.enroll_quest(q)
             random_sleep(2, 5)
@@ -958,9 +968,9 @@ class QuestAutocompleter:
 
     # ── Video group ────────────────────────────────────────────────────────
     def _run_video_group(self, states: List[QuestState]):
-        log(f"Video group starting ({len(states)} quest(s))", "info")
+        log(f"Video group starting ({len(states, account=self.account)} quest(s))", "info")
         for s in states:
-            log(f"  • {s.name}  {s.seconds_done:.0f}/{s.seconds_needed}s", "info")
+            log(f"  • {s.name}  {s.seconds_done:.0f}/{s.seconds_needed}s", "info", account=self.account)
             s.status = "running"
 
         while True:
@@ -993,7 +1003,7 @@ class QuestAutocompleter:
                         state.advance(server_progress if server_progress is not None else timestamp)
                         log(
                             f"[{state.name}] {state.seconds_done:.0f}/"
-                            f"{state.seconds_needed}s ({state.pct:.0f}%)", "progress"
+                            f"{state.seconds_needed}s ({state.pct:.0f}%, account=self.account)", "progress"
                         )
                         if body.get("completed_at") or state.completed:
                             try:
@@ -1003,15 +1013,15 @@ class QuestAutocompleter:
                                 )
                             except Exception:
                                 pass
-                            log(f"Video done: {state.name}", "ok")
+                            log(f"Video done: {state.name}", "ok", account=self.account)
                             state.status = "done"; state.completed = True
                             self.mark_completed(qid)
                     elif r.status_code == 429:
                         _wait_for_rate_limit(r, state.name)
                     else:
-                        log(f"Video error ({r.status_code}) [{state.name}]: {r.text[:200]}", "warn")
+                        log(f"Video error ({r.status_code}, account=self.account) [{state.name}]: {r.text[:200]}", "warn")
                 except Exception as e:
-                    log(f"Video error [{state.name}]: {e}", "error")
+                    log(f"Video error [{state.name}]: {e}", "error", account=self.account)
             if all_done:
                 break
             # If no quest was active this tick (all still within rate-cap window),
@@ -1020,7 +1030,7 @@ class QuestAutocompleter:
 
     # ── Heartbeat group ────────────────────────────────────────────────────
     def _run_heartbeat_group(self, states: List[QuestState]):
-        log(f"Heartbeat group starting ({len(states)} quest(s), one thread each)", "info")
+        log(f"Heartbeat group starting ({len(states, account=self.account)} quest(s), one thread each)", "info")
 
         def _worker(state: QuestState):
             qid = state.quest["id"]
@@ -1030,7 +1040,7 @@ class QuestAutocompleter:
             uid_fake   = random.randint(10**17, 10**18 - 1)
             stream_key = f"guild:{guild_id}:{channel_id}:{uid_fake}"
             state.status = "running"
-            log(f"{state.name}  ~{state.remaining // 60:.0f}m remaining [{state.task_type}]", "info")
+            log(f"{state.name}  ~{state.remaining // 60:.0f}m remaining [{state.task_type}]", "info", account=self.account)
 
             while not state.completed:
                 try:
@@ -1045,7 +1055,7 @@ class QuestAutocompleter:
                             state.advance(prog_data[state.task_type].get("value", state.seconds_done))
                         log(
                             f"[{state.name}] {state.seconds_done:.0f}/"
-                            f"{state.seconds_needed}s ({state.pct:.0f}%)", "progress"
+                            f"{state.seconds_needed}s ({state.pct:.0f}%, account=self.account)", "progress"
                         )
                         if body.get("completed_at") or state.completed:
                             try:
@@ -1055,18 +1065,18 @@ class QuestAutocompleter:
                                 )
                             except Exception:
                                 pass
-                            log(f"Heartbeat done: {state.name}", "ok")
+                            log(f"Heartbeat done: {state.name}", "ok", account=self.account)
                             state.status = "done"; state.completed = True
                             self.mark_completed(qid); return
                     elif r.status_code == 429:
                         _wait_for_rate_limit(r, state.name); continue
                     else:
                         log(
-                            f"Heartbeat error ({r.status_code}) [{state.name}]: {r.text[:200]}",
+                            f"Heartbeat error ({r.status_code}, account=self.account) [{state.name}]: {r.text[:200]}",
                             "warn"
                         )
                 except Exception as e:
-                    log(f"Heartbeat error [{state.name}]: {e}", "error")
+                    log(f"Heartbeat error [{state.name}]: {e}", "error", account=self.account)
                 human_sleep(HEARTBEAT_INTERVAL, pct=0.15)
 
         workers = [
@@ -1085,8 +1095,8 @@ class QuestAutocompleter:
                       .get("ACHIEVEMENT_IN_ACTIVITY", {}).get("value", 0))
         target  = info.get("target", 1)
         ename   = info.get("event_name", "progress")
-        log(f'Skipping "{name}" [ACHIEVEMENT — manual only] {already}/{target}', "warn")
-        log(f"  ↳ Play Discord Activity until '{ename}' fires {target - already}x", "info")
+        log(f'Skipping "{name}" [ACHIEVEMENT — manual only] {already}/{target}', "warn", account=self.account)
+        log(f"  ↳ Play Discord Activity until '{ename}' fires {target - already}x", "info", account=self.account)
 
     # ── Run all ────────────────────────────────────────────────────────────
     def run_all_quests(self, quests: list):
@@ -1101,7 +1111,7 @@ class QuestAutocompleter:
                 continue
             if not tt:
                 raw = get_raw_task_keys(quest)
-                log(f'"{name}" — unknown task {raw}, skipping', "warn"); continue
+                log(f'"{name}" — unknown task {raw}, skipping', "warn", account=self.account); continue
             if tt in ACHIEVEMENT_TASKS:
                 self._handle_achievement(quest); continue
             state = self._make_state(quest)
@@ -1113,7 +1123,7 @@ class QuestAutocompleter:
             elif tt in HEARTBEAT_TASKS:
                 hb_states.append(state)
             else:
-                log(f"No handler for {tt} [{name}], skipping", "warn")
+                log(f"No handler for {tt} [{name}], skipping", "warn", account=self.account)
 
         if not all_states:
             return
@@ -1134,30 +1144,30 @@ class QuestAutocompleter:
             ))
         for t in threads: t.start()
         for t in threads: t.join()
-        log("All quest groups finished.", "ok")
+        log("All quest groups finished.", "ok", account=self.account)
 
     # ── Main loop ──────────────────────────────────────────────────────────
     def run(self):
-        log("Velocity X started", "ok")
-        log(f"Auto-accept: {'ON' if AUTO_ACCEPT else 'OFF'}  Poll: {POLL_INTERVAL}s", "info")
+        log(f"Velocity X started — account: {self.account}", "ok", account=self.account)
+        log(f"Auto-accept: {'ON' if AUTO_ACCEPT else 'OFF'}  Poll: {POLL_INTERVAL}s", "info", account=self.account)
         cycle = 0
 
         while True:
             cycle += 1
             if _dash: _dash.set_cycle(cycle)
-            log(f"Scan #{cycle}", "info")
+            log(f"Scan #{cycle}", "info", account=self.account)
             if _dash: _dash.set_status("SCANNING...", ok=True)
 
             quests = self.fetch_quests()
 
             if not quests:
-                log("No quests found", "info")
+                log("No quests found", "info", account=self.account)
                 if _dash: _dash.set_rows([])
             else:
                 total     = len(quests)
                 enrolled  = sum(1 for q in quests if is_enrolled(q))
                 completed = sum(1 for q in quests if is_completed(q))
-                log(f"Total: {total}  Enrolled: {enrolled}  Completed: {completed}", "info")
+                log(f"Total: {total}  Enrolled: {enrolled}  Completed: {completed}", "info", account=self.account)
 
                 for q in quests:
                     name   = get_quest_name(q)
@@ -1177,7 +1187,7 @@ class QuestAutocompleter:
                         except Exception:
                             pass
                     rew_note = f" [{reward}]" if reward != "—" else ""
-                    log(f"  {mark} {name}{rew_note} [{tt or '?'}]{expiry_note}", "info")
+                    log(f"  {mark} {name}{rew_note} [{tt or '?'}]{expiry_note}", "info", account=self.account)
 
                 quests     = self.auto_accept(quests)
                 actionable = [
@@ -1187,31 +1197,52 @@ class QuestAutocompleter:
                 ]
 
                 if actionable:
-                    log(f"{len(actionable)} quest(s) ready — launching parallel groups", "info")
+                    log(f"{len(actionable, account=self.account)} quest(s) ready — launching parallel groups", "info")
                     if _dash: _dash.set_status("RUNNING QUESTS...", ok=True)
                     t0 = time.time()
                     self.run_all_quests(actionable)
                     elapsed = time.time() - t0
                     done_n  = sum(1 for q in actionable if self.is_already_done(q.get("id")))
-                    log(f"Session done: {done_n}/{len(actionable)} in {elapsed/60:.1f}m", "ok")
+                    log(f"Session done: {done_n}/{len(actionable, account=self.account)} in {elapsed/60:.1f}m", "ok")
                     for q in actionable:
                         mark = "✅" if self.is_already_done(q.get("id")) else "⏳"
-                        log(f"  {mark} {get_quest_name(q)}", "info")
+                        log(f"  {mark} {get_quest_name(q, account=self.account)}", "info")
                 else:
-                    log("No quests need completion right now", "info")
+                    log("No quests need completion right now", "info", account=self.account)
                     if _dash: _dash.set_rows([])
 
             wait = jitter(POLL_INTERVAL, 0.10)
             if _dash:
                 _dash.set_status("SYSTEM RUNNING...", ok=True)
                 _dash.set_next_scan(time.time() + wait)
-            log(f"Waiting {wait:.0f}s...", "info")
+            log(f"Waiting {wait:.0f}s...", "info", account=self.account)
             time.sleep(wait)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Entry point
 # ─────────────────────────────────────────────────────────────────────────────
+def _run_account(token: str, build_number: int, failed_accounts: list, lock: threading.Lock):
+    """Worker for one account. Runs until KeyboardInterrupt or fatal error."""
+    api      = DiscordAPI(token, build_number)
+    username = api.validate_token()
+    if username is None:
+        with lock:
+            failed_accounts.append(token[:20] + "...")
+        return
+    if _dash:
+        _dash.set_user(username, "")
+    completer = QuestAutocompleter(api, account=username)
+    try:
+        completer.run()
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        log(f"Fatal error: {e}", "error", account=username)
+        if DEBUG:
+            traceback.print_exc()
+
+
 def main():
     global _dash
 
@@ -1219,27 +1250,41 @@ def main():
     _dash.set_status("INITIALIZING...", ok=False)
     _dash.start()
 
-    _exit_reason: Optional[str] = None
     try:
-        log("Fetching build number...", "info")
-        build_number = fetch_latest_build_number()
-        api          = DiscordAPI(TOKEN, build_number)
-        if not api.validate_token():
-            _exit_reason = "Token validation failed — check TOKEN_DISCORD in config.json"
-        else:
-            completer = QuestAutocompleter(api)
-            completer.run()
+        log(f"Fetching build number... ({len(TOKENS)} account(s))", "info")
+        build_number    = fetch_latest_build_number()
+        failed_accounts: list = []
+        lock            = threading.Lock()
+
+        workers = [
+            threading.Thread(
+                target=_run_account,
+                args=(token, build_number, failed_accounts, lock),
+                name=f"Account-{i+1}",
+                daemon=True,
+            )
+            for i, token in enumerate(TOKENS)
+        ]
+
+        for w in workers:
+            w.start()
+            # Stagger account startup slightly to avoid simultaneous token validation
+            if len(workers) > 1:
+                time.sleep(random.uniform(1.5, 3.0))
+
+        for w in workers:
+            w.join()
+
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        _exit_reason = f"Unexpected error: {e}"
+        log(f"Unexpected error: {e}", "error")
         if DEBUG:
             traceback.print_exc()
     finally:
         _dash.stop()
-        if _exit_reason:
-            print(f"\n{A.RED}X {_exit_reason}{A.RST}")
-            sys.exit(1)
+        if failed_accounts:
+            print(f"\n{A.RED}X Failed accounts ({len(failed_accounts)}): {', '.join(failed_accounts)}{A.RST}")
         print(f"\n{A.GRN}Stopped.{A.RST}")
 
 if __name__ == "__main__":
