@@ -541,19 +541,19 @@ class DiscordAPI:
             base += random.uniform(1.0, 2.5)
         time.sleep(base)
 
-    def get(self, path: str, **kw) -> requests.Response:
+    def get(self, path: str, timeout: int = 30, **kw) -> requests.Response:
         log(f"GET {path}", "debug")
         with self._lock:
             self._delay()
-            r = self.session.get(f"https://discord.com/api/v9{path}", **kw)
+            r = self.session.get(f"https://discord.com/api/v9{path}", timeout=timeout, **kw)
         log(f"  -> {r.status_code}", "debug")
         return r
 
-    def post(self, path: str, payload: Optional[dict] = None, **kw) -> requests.Response:
+    def post(self, path: str, payload: Optional[dict] = None, timeout: int = 30, **kw) -> requests.Response:
         log(f"POST {path}", "debug")
         with self._lock:
             self._delay()
-            r = self.session.post(f"https://discord.com/api/v9{path}", json=payload, **kw)
+            r = self.session.post(f"https://discord.com/api/v9{path}", json=payload, timeout=timeout, **kw)
         log(f"  -> {r.status_code}", "debug")
         return r
 
@@ -964,7 +964,8 @@ class QuestAutocompleter:
             s.status = "running"
 
         while True:
-            all_done = True
+            all_done    = True   # True only when every state is .completed
+            any_active  = False  # True when at least one state sent a request this tick
             for state in states:
                 if state.completed:
                     continue
@@ -973,6 +974,7 @@ class QuestAutocompleter:
                 max_allowed = (time.time() - state.enrolled_ts) + VIDEO_MAX_FUTURE
                 if max_allowed - state.seconds_done < VIDEO_SPEED:
                     continue
+                any_active = True
                 # slight random offset to avoid a perfectly mechanical pattern
                 timestamp = min(
                     float(state.seconds_needed),
@@ -982,7 +984,13 @@ class QuestAutocompleter:
                     r = self.api.post(f"/quests/{qid}/video-progress", {"timestamp": timestamp})
                     if r.status_code == 200:
                         body = r.json()
-                        state.advance(timestamp)
+                        # Prefer server-authoritative progress; fall back to our timestamp
+                        server_progress = (
+                            body.get("progress", {})
+                            .get(state.task_type, {})
+                            .get("value")
+                        )
+                        state.advance(server_progress if server_progress is not None else timestamp)
                         log(
                             f"[{state.name}] {state.seconds_done:.0f}/"
                             f"{state.seconds_needed}s ({state.pct:.0f}%)", "progress"
@@ -1006,7 +1014,9 @@ class QuestAutocompleter:
                     log(f"Video error [{state.name}]: {e}", "error")
             if all_done:
                 break
-            time.sleep(VIDEO_TICK_INTERVAL)
+            # If no quest was active this tick (all still within rate-cap window),
+            # sleep a bit longer to avoid a busy-wait spin until the window opens.
+            time.sleep(VIDEO_TICK_INTERVAL if any_active else min(3.0, VIDEO_SPEED / 2))
 
     # ── Heartbeat group ────────────────────────────────────────────────────
     def _run_heartbeat_group(self, states: List[QuestState]):
@@ -1029,10 +1039,10 @@ class QuestAutocompleter:
                         {"stream_key": stream_key, "terminal": False}
                     )
                     if r.status_code == 200:
-                        body = r.json()
-                        pd   = body.get("progress", {})
-                        if pd and state.task_type in pd:
-                            state.advance(pd[state.task_type].get("value", state.seconds_done))
+                        body      = r.json()
+                        prog_data = body.get("progress", {})
+                        if prog_data and state.task_type in prog_data:
+                            state.advance(prog_data[state.task_type].get("value", state.seconds_done))
                         log(
                             f"[{state.name}] {state.seconds_done:.0f}/"
                             f"{state.seconds_needed}s ({state.pct:.0f}%)", "progress"
