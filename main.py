@@ -1002,7 +1002,8 @@ class QuestAutocompleter:
                         state.advance(server_progress if server_progress is not None else timestamp)
                         log(
                             f"[{state.name}] {state.seconds_done:.0f}/"
-                            f"{state.seconds_needed}s ({state.pct:.0f}%, account=self.account)", "progress"
+                            f"{state.seconds_needed}s ({state.pct:.0f}%)", "progress",
+                            account=self.account
                         )
                         if body.get("completed_at") or state.completed:
                             try:
@@ -1054,7 +1055,8 @@ class QuestAutocompleter:
                             state.advance(prog_data[state.task_type].get("value", state.seconds_done))
                         log(
                             f"[{state.name}] {state.seconds_done:.0f}/"
-                            f"{state.seconds_needed}s ({state.pct:.0f}%, account=self.account)", "progress"
+                            f"{state.seconds_needed}s ({state.pct:.0f}%)", "progress",
+                            account=self.account
                         )
                         if body.get("completed_at") or state.completed:
                             try:
@@ -1071,7 +1073,7 @@ class QuestAutocompleter:
                         _wait_for_rate_limit(r, state.name); continue
                     else:
                         log(
-                            f"Heartbeat error ({r.status_code}, account=self.account) [{state.name}]: {r.text[:200]}",
+                            f"Heartbeat error ({r.status_code}) [{state.name}]: {r.text[:200]}",
                             "warn"
                         )
                 except Exception as e:
@@ -1205,7 +1207,7 @@ class QuestAutocompleter:
                     log(f"Session done: {done_n}/{len(actionable)} in {elapsed/60:.1f}m", "ok", account=self.account)
                     for q in actionable:
                         mark = "✅" if self.is_already_done(q.get("id")) else "⏳"
-                        log(f"  {mark} {get_quest_name(q, account=self.account)}", "info")
+                        log(f"  {mark} {get_quest_name(q)}", "info", account=self.account)
                 else:
                     log("No quests need completion right now", "info", account=self.account)
                     if _dash: _dash.set_rows([])
