@@ -86,6 +86,7 @@ class QuestState:
     reward:         str   = "—"
     completed:      bool  = False
     status:         str   = "queued"
+    paused:         bool  = False  # <--- Tambahan status pause
     last_update:    float = field(default_factory=time.time)
     lock:           threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
@@ -94,10 +95,21 @@ class QuestState:
     def advance(self, value: float):
         with self.lock:
             self.seconds_done = value
-            self.status = "running"
+            if not self.paused:
+                self.status = "running"
             if self.seconds_done >= self.seconds_needed:
                 self.completed = True
                 self.status    = "done"
+
+    def toggle_pause(self):
+        with self.lock:
+            if self.completed:
+                return
+            self.paused = not self.paused
+            if self.paused:
+                self.status = "paused"
+            else:
+                self.status = "running"
 
     @property
     def remaining(self) -> float:
@@ -137,6 +149,7 @@ class Dashboard:
         self._cycle       = 0
         self._running     = False
         self._thread: Optional[threading.Thread] = None
+        self._input_thread: Optional[threading.Thread] = None
         self._start_ts    = time.time()
         self._spin_frame  = 0
 
@@ -170,6 +183,10 @@ class Dashboard:
         sys.stdout.flush()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="Dashboard")
         self._thread.start()
+        
+        # Start input listener thread for touch/interactive pause-play via terminal
+        self._input_thread = threading.Thread(target=self._input_loop, daemon=True, name="DashInput")
+        self._input_thread.start()
 
     def stop(self):
         self._running = False
@@ -188,7 +205,28 @@ class Dashboard:
                 pass
             time.sleep(RENDER_HZ)
 
-    # ── Drawing helpers ────────────────────────────────────────────────────
+    def _input_loop(self):
+        """Allows toggling pause/play by typing the quest number and pressing Enter."""
+        while self._running:
+            try:
+                # Non-blocking or standard input check depending on implementation
+                line = sys.stdin.readline()
+                if not line:
+                    break
+                val = line.strip()
+                if val.isdigit():
+                    idx = int(val) - 1
+                    with self._lock:
+                        rows = list(self._rows)
+                    if 0 <= idx < len(rows):
+                        st = rows[idx]
+                        st.toggle_pause()
+                        status_txt = "PAUSED" if st.paused else "RESUMED"
+                        self.add_log(datetime.now().strftime("%H:%M:%S"), "info", f"Quest #{idx+1} {status_txt} by user input.")
+            except Exception:
+                pass
+
+    # ── Drawing helpers ────────────────────────────────────────────────    
     @staticmethod
     def _tw() -> int:
         return shutil.get_terminal_size((100, 30)).columns
@@ -202,12 +240,6 @@ class Dashboard:
         plain = re.sub(r'\033\[[^m]*m', '', txt)
         pad   = max(0, tw - len(plain))
         return txt + fill * pad + A.ELINE
-
-    def _hline(self, char: str = "─", left: str = "├", right: str = "┤",
-               color: str = "") -> str:
-        tw  = self._tw()
-        mid = char * (tw - 2)
-        return self._line(f"{color}{left}{mid}{right}{A.RST}")
 
     def _render(self):
         with self._lock:
@@ -283,9 +315,12 @@ class Dashboard:
                 name_d = (st.name[:NAME_W-1] + "…") if len(st.name) > NAME_W else st.name
                 rew_d  = (st.reward[:REW_W-1] + "…") if len(st.reward) > REW_W else st.reward
 
-                if st.status == "done":
+                if st.completed:
                     tl_col, tl_str = A.GRN, "✓ DONE"
                     st_col, st_str = A.GRN, "✓ Done"
+                elif st.paused:
+                    tl_col, tl_str = A.YLW, "⏸ PAUSED"
+                    st_col, st_str = A.YLW, "⏸ Paused"
                 elif st.status == "running":
                     mm, ss = divmod(int(st.remaining), 60)
                     sp     = SPIN[spin % len(SPIN)]
@@ -339,7 +374,7 @@ class Dashboard:
             out.append(W())
 
         out.append(W(f"{A.DIM}{'─' * tw}{A.RST}"))
-        out.append(W(f" {A.DIM}Ctrl+C to stop{A.RST}"))
+        out.append(W(f" {A.YLW}[Type Quest number & Enter to Pause/Play] {A.DIM}| Ctrl+C to stop{A.RST}"))
 
         sys.stdout.write(A.HOME + "\n".join(out))
         sys.stdout.flush()
@@ -614,10 +649,6 @@ def get_quest_name(quest: dict) -> str:
     return f"Quest#{quest.get('id', '?')}"
 
 def _dump_quest_debug(quests: list):
-    """
-    Write raw quest JSON to quest_debug.json on first fetch.
-    Delete that file to re-dump next run.
-    """
     path = "quest_debug.json"
     if os.path.exists(path):
         return
@@ -630,11 +661,6 @@ def _dump_quest_debug(quests: list):
 
 
 def _orb_label(item: dict) -> Optional[str]:
-    """
-    Discord Orb rewards look like {"type": "DISCORD_PRODUCT", "amount": 700}.
-    Detect any integer/float amount field and return "N Discord Orbs".
-    Also handles {"currency": "orbs", "quantity": 700} and similar shapes.
-    """
     amount = None
     for k in ("amount", "quantity", "count", "value"):
         v = item.get(k)
@@ -642,18 +668,14 @@ def _orb_label(item: dict) -> Optional[str]:
             amount = int(v); break
     if amount is None:
         return None
-    # confirm it looks like an orb/currency reward, not e.g. a duration
     rtype = str(item.get("type", "") or item.get("currency", "") or "").upper()
     is_orb = any(x in rtype for x in ("ORB", "DISCORD_PRODUCT", "CREDIT", "COIN", "TOKEN"))
-    if is_orb or amount >= 100:   # ≥100 is almost certainly orbs not seconds
+    if is_orb or amount >= 100:
         return f"{amount} Discord Orbs"
     return None
 
 
-# Keys that belong to the application/game metadata — never the reward
 _APP_KEYS = {"application", "app", "game", "publisher", "developer", "guild"}
-
-# Keys whose string values ARE reward names
 _REWARD_NAME_KEYS = {
     "rewardDescription", "reward_description",
     "rewardTitle",       "reward_title",
@@ -663,8 +685,6 @@ _REWARD_NAME_KEYS = {
     "item_name",         "itemName",
     "label",
 }
-
-# Keys that are reward containers (walk these first)
 _REWARD_CONTAINERS = {
     "reward", "rewards", "rewardItems", "reward_items",
     "prize", "prizes", "items", "entitlements",
@@ -672,33 +692,24 @@ _REWARD_CONTAINERS = {
 
 
 def _walk_for_reward(obj, depth: int = 0, _skip_app: bool = True) -> Optional[str]:
-    """
-    Recursively walk a dict/list looking for an orb amount or a string
-    on a reward-name key.  Skips application/game subtrees so we never
-    accidentally return the game title as the reward.
-    """
     if depth > 6:
         return None
 
     if isinstance(obj, dict):
-        # ── orb / integer amount check first ──────────────────────────────
         orb = _orb_label(obj)
         if orb:
             return orb
 
-        # ── string values on explicit reward-name keys ────────────────────
         for k, v in obj.items():
             if k in _REWARD_NAME_KEYS and isinstance(v, str) and v.strip():
                 return v.strip()
 
-        # ── recurse into reward containers (priority) ─────────────────────
         for k in _REWARD_CONTAINERS:
             if k in obj:
                 hit = _walk_for_reward(obj[k], depth + 1)
                 if hit:
                     return hit
 
-        # ── recurse into everything else, skipping app/game keys ──────────
         for k, v in obj.items():
             if k in _REWARD_CONTAINERS or (_skip_app and k in _APP_KEYS):
                 continue
@@ -716,31 +727,19 @@ def _walk_for_reward(obj, depth: int = 0, _skip_app: bool = True) -> Optional[st
 
 
 def get_quest_reward(quest: dict) -> str:
-    """
-    Extracts the reward label from a Discord quest.
-
-    Real Discord structure (confirmed from API):
-      config.rewards_config.rewards[0].messages.name  →  "700 Orbs"
-      config.rewards_config.rewards[0].orb_quantity   →  700
-    """
     cfg = quest.get("config", {})
-
-    # ── 1. rewards_config.rewards  (confirmed real Discord path) ────────────
     rc = cfg.get("rewards_config", {})
     for item in rc.get("rewards", [])[:1]:
         if not isinstance(item, dict):
             continue
-        # best: messages.name inside the reward item
         item_msgs = item.get("messages", {})
         name = item_msgs.get("name") or item_msgs.get("name_with_article")
         if name and isinstance(name, str):
             return name.strip()
-        # fallback: orb_quantity integer
         qty = item.get("orb_quantity") or item.get("premium_orb_quantity")
         if isinstance(qty, (int, float)) and qty > 0:
             return f"{int(qty)} Orbs"
 
-    # ── 2. Legacy / alternate reward list fields ─────────────────────────────
     for key in ("rewardItems", "reward_items", "rewards", "prize", "prizes"):
         items = cfg.get(key)
         if not items or not isinstance(items, list):
@@ -762,7 +761,6 @@ def get_quest_reward(quest: dict) -> str:
             if v and isinstance(v, str):
                 return v.strip()
 
-    # ── 3. Top-level config messages ─────────────────────────────────────────
     msgs = cfg.get("messages", {})
     for key in ("rewardDescription", "reward_description", "rewardTitle",
                 "reward_title", "rewardName", "reward_name"):
@@ -770,7 +768,6 @@ def get_quest_reward(quest: dict) -> str:
         if v and isinstance(v, str):
             return v.strip()
 
-    # ── 4. Recursive tree-walk (last resort, skips application subtree) ──────
     hit = _walk_for_reward(rc) or _walk_for_reward(cfg)
     if hit and len(hit) < 80:
         return hit
@@ -860,7 +857,7 @@ def get_enrolled_at(quest: dict) -> Optional[str]:
 class QuestAutocompleter:
     def __init__(self, api: DiscordAPI, account: str = ""):
         self.api             = api
-        self.account         = account   # display name for log prefixing
+        self.account         = account
         self._completed_ids: set = set()
         self._ids_lock       = threading.Lock()
 
@@ -909,7 +906,7 @@ class QuestAutocompleter:
         qid  = quest["id"]
         for attempt in range(1, 4):
             try:
-                random_sleep(2.0, 5.0)   # slightly longer pre-enroll pause
+                random_sleep(2.0, 5.0)
                 r = self.api.post(f"/quests/{qid}/enroll", {
                     "location":               ENROLL_LOCATION,
                     "is_targeted":            False,
@@ -973,18 +970,23 @@ class QuestAutocompleter:
             s.status = "running"
 
         while True:
-            all_done    = True   # True only when every state is .completed
-            any_active  = False  # True when at least one state sent a request this tick
+            all_done    = True
+            any_active  = False
             for state in states:
                 if state.completed:
                     continue
                 all_done = False
+                
+                # --- Pengecekan Pause State ---
+                if state.paused:
+                    continue
+                # ------------------------------
+
                 qid         = state.quest["id"]
                 max_allowed = (time.time() - state.enrolled_ts) + VIDEO_MAX_FUTURE
                 if max_allowed - state.seconds_done < VIDEO_SPEED:
                     continue
                 any_active = True
-                # slight random offset to avoid a perfectly mechanical pattern
                 timestamp = min(
                     float(state.seconds_needed),
                     state.seconds_done + VIDEO_SPEED + random.uniform(-0.3, 0.8)
@@ -993,7 +995,6 @@ class QuestAutocompleter:
                     r = self.api.post(f"/quests/{qid}/video-progress", {"timestamp": timestamp})
                     if r.status_code == 200:
                         body = r.json()
-                        # Prefer server-authoritative progress; fall back to our timestamp
                         server_progress = (
                             body.get("progress", {})
                             .get(state.task_type, {})
@@ -1024,8 +1025,6 @@ class QuestAutocompleter:
                     log(f"Video error [{state.name}]: {e}", "error", account=self.account)
             if all_done:
                 break
-            # If no quest was active this tick (all still within rate-cap window),
-            # sleep a bit longer to avoid a busy-wait spin until the window opens.
             time.sleep(VIDEO_TICK_INTERVAL if any_active else min(3.0, VIDEO_SPEED / 2))
 
     # ── Heartbeat group ────────────────────────────────────────────────────
@@ -1034,7 +1033,6 @@ class QuestAutocompleter:
 
         def _worker(state: QuestState):
             qid = state.quest["id"]
-            # Generate a realistic-looking stream key
             guild_id   = random.randint(10**17, 10**18 - 1)
             channel_id = random.randint(10**17, 10**18 - 1)
             uid_fake   = random.randint(10**17, 10**18 - 1)
@@ -1043,6 +1041,12 @@ class QuestAutocompleter:
             log(f"{state.name}  ~{state.remaining // 60:.0f}m remaining [{state.task_type}]", "info", account=self.account)
 
             while not state.completed:
+                # --- Pengecekan Pause State ---
+                if state.paused:
+                    time.sleep(1)
+                    continue
+                # ------------------------------
+
                 try:
                     r = self.api.post(
                         f"/quests/{qid}/heartbeat",
@@ -1224,7 +1228,6 @@ class QuestAutocompleter:
 #  Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_account(token: str, build_number: int, failed_accounts: list, lock: threading.Lock):
-    """Worker for one account. Runs until KeyboardInterrupt or fatal error."""
     api      = DiscordAPI(token, build_number)
     username = api.validate_token()
     if username is None:
@@ -1281,7 +1284,6 @@ def main():
 
         for w in workers:
             w.start()
-            # Stagger account startup slightly to avoid simultaneous token validation
             if len(workers) > 1:
                 time.sleep(random.uniform(1.5, 3.0))
 
